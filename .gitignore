@@ -1,0 +1,30 @@
+# The original handoff brief. It is an internal document and is deliberately
+# not published; section references to it are explained in README.md/REPORT.md.
+handoff.md
+
+# Build trees. Kept strictly separate: the performance build must never be
+# mixed with the sanitizer build (different flags, different binaries).
+build/
+build-asan/
+
+# Object files, static/shared libraries, test binaries
+*.o
+*.a
+*.so
+*.so.*
+*.d
+
+# Test/bench artifacts. NOTE: the integration lab itself lives outside the
+# tree ($IPC_LAB, default /opt/ipc-lab), this is just a catch-all.
+*.out
+results.txt
+core
+core.*
+
+# WorkBuddy project metadata (agent session state), not part of the source
+.workbuddy/
+
+# Editor / OS noise
+*~
+.*.swp
+.DS_Store

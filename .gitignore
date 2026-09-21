@@ -2,6 +2,10 @@
 # not published; section references to it are explained in README.md/REPORT.md.
 handoff.md
 
+# Reference material (third-party coding standards, vendor specs). Not ours to
+# publish: it includes a Huawei DKBA specification and OpenHarmony guides.
+.refs/
+
 # Build trees. Kept strictly separate: the performance build must never be
 # mixed with the sanitizer build (different flags, different binaries).
 build/
@@ -23,6 +27,11 @@ core.*
 
 # WorkBuddy project metadata (agent session state), not part of the source
 .workbuddy/
+
+# Reference material (coding standards) downloaded for local study. The
+# DKBA 2826-2011.5 original is marked Huawei confidential / do not distribute,
+# so it must never be committed to this public repository.
+.refs/
 
 # Editor / OS noise
 *~

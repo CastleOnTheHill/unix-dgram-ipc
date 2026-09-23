@@ -1,5 +1,12 @@
 /*
- * ipc_util.h -- logging, errno mapping and small helpers.
+ * Copyright (c) 2026 <版权方待定>
+ * 许可协议：<待定>
+ *
+ * ipc_util.h -- 库内部通用小工具。**不对外安装**。
+ *
+ * 命名遵循《OpenHarmony C 语言编程规范》：函数大驼峰、参数小驼峰。
+ * 本头文件属于模块内部接口，因此不加 extern "C" 包裹；需要从 C++ 引用时
+ * 请在外层自行包裹。
  */
 #ifndef IPC_UTIL_H
 #define IPC_UTIL_H
@@ -8,49 +15,65 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#include "ipc/ipc.h"
+/* ------------------------------------------------------------------ */
+/* 字符串                                                             */
+/* ------------------------------------------------------------------ */
 
-typedef enum {
-    IPC_LOG_ERROR = 0,
-    IPC_LOG_WARN  = 1,
-    IPC_LOG_INFO  = 2,
-    IPC_LOG_DEBUG = 3
-} ipc_log_level_t;
+/*
+ * strlcpy 语义：目标始终以 NUL 结尾（cap > 0 时），**返回源字符串的完整
+ * 长度**（不是实际拷贝进去的长度）。调用者用它判断有没有被截断：
+ * 返回值 >= cap 就是截断了。
+ *
+ * 为什么不用 snprintf：它的返回值语义在「被截断」这一点上依赖实现细节，
+ * 而 strlcpy 的返回值是确定的。本库所有定长名字字段都走这里。
+ */
+size_t IpcStrlcpy(char *dst, const char *src, size_t cap);
 
-/* Default level comes from the IPC_LOG_LEVEL env var (error|warn|info|debug),
- * falling back to warn. Quiet enough for tests, verbose enough to debug. */
-void ipc_log_set_level(ipc_log_level_t lvl);
-ipc_log_level_t ipc_log_get_level(void);
-void ipc_logf(ipc_log_level_t lvl, const char *fmt, ...)
-    __attribute__((format(printf, 2, 3)));
+/*
+ * 把一段可能不含 NUL 的载荷转成可打印字符串，供日志与测试断言使用。
+ * 非可打印字节（< 0x20 或 >= 0x7f）一律替换成 '.'，末尾补 NUL。
+ */
+void IpcPayloadToCStr(const void *data, size_t len, char *out, size_t cap);
 
-#define IPC_LOGE(...) ipc_logf(IPC_LOG_ERROR, __VA_ARGS__)
-#define IPC_LOGW(...) ipc_logf(IPC_LOG_WARN, __VA_ARGS__)
-#define IPC_LOGI(...) ipc_logf(IPC_LOG_INFO, __VA_ARGS__)
-#define IPC_LOGD(...) ipc_logf(IPC_LOG_DEBUG, __VA_ARGS__)
+/* ------------------------------------------------------------------ */
+/* 错误码                                                             */
+/* ------------------------------------------------------------------ */
 
-/* Map a failing-errno value to the library error space.  Never returns 0. */
-int ipc_errno_to_rc(int err);
+/* errno → 本库返回码。传入 0 返回 IPC_OK。 */
+int32_t IpcErrnoToResult(int32_t err);
 
-/* Bounded copy; always NUL terminates.  Returns the source length. */
-size_t ipc_strlcpy(char *dst, const char *src, size_t cap);
+/* errno → 可读字符串。内部转发 strerror，保证不为 NULL。 */
+const char *IpcErrnoString(int32_t err);
 
-/* Monotonic nanoseconds since an arbitrary epoch. */
-uint64_t ipc_mono_ns(void);
+/* ------------------------------------------------------------------ */
+/* 时间与实例代际号                                                    */
+/* ------------------------------------------------------------------ */
 
-/* Wall-clock nanoseconds since the Unix epoch (for logs/journal only). */
-uint64_t ipc_real_ns(void);
+/* CLOCK_MONOTONIC 纳秒。失败返回 0（调用者按「没有时间」处理）。 */
+uint64_t IpcMonoNs(void);
 
-/* splitmix64 finalizer: used to decorrelate the instance-id mix. */
-uint64_t ipc_mix64(uint64_t x);
+/* 64 位混合函数（splitmix64 常数），用于把弱熵摊开。 */
+uint64_t IpcMix64(uint64_t x);
 
-/* Generate a process instance id that is unique for practical purposes:
- * hash(boot_id) + pid + monotonic nanoseconds, mixed.  Two successive
- * registrations in the same process already differ. */
-uint64_t ipc_gen_instance_id(void);
+/*
+ * 生成进程实例代际号。
+ *
+ * 语义要求：**同一个 socket 路径上先后两次注册，必须得到不同的值**，
+ * 否则对端无法识别「上一代实例残留的陈旧回复」。做法是把 boot_id、
+ * 单调时钟和 pid 混在一起，而不是只用 pid —— pid 会被快速回收，
+ * 反而是最容易撞的那个。
+ */
+uint64_t IpcGenInstanceId(void);
 
-/* Read the whole of `path` into a malloc'd NUL-terminated buffer.
- * *out_err receives an ipc_err_t on failure. */
-char *ipc_read_file(const char *path, size_t max_bytes, int *out_err);
+/* ------------------------------------------------------------------ */
+/* 文件                                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 读整个文件到堆上并以 NUL 结尾。成功后返回 malloc 的缓冲（调用者 free），
+ * 失败返回 NULL 并把原因写进 outErr（可为 NULL）。
+ * maxBytes 是硬上限，超过即报 IPC_ERR_MSGSIZE，避免被巨大文件拖垮。
+ */
+char *IpcReadFile(const char *path, size_t maxBytes, int32_t *outErr);
 
 #endif /* IPC_UTIL_H */

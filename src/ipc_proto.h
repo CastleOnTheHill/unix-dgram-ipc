@@ -1,29 +1,12 @@
 /*
- * ipc_proto.h -- wire format and SCM_CREDENTIALS parsing.
+ * Copyright (c) 2026 <版权方待定>
+ * 许可协议：<待定>
  *
- * Pure data-in / data-out code with no socket access, so it can be unit
- * tested with synthetic buffers (see tests/unit/test_proto.c).
+ * ipc_proto.h -- 线格式编解码。**不对外安装**。
  *
- * Wire header: fixed width, explicit big-endian, serialised field by field.
- * A raw C struct is deliberately NOT used on the wire because of padding,
- * alignment and endianness.
- *
- *  off  size  field
- *  ---  ----  -----------------------------------------------------------
- *    0     4  magic "UIPC"
- *    4     1  version
- *    5     1  type (ipc_msg_type_t)
- *    6     1  flags (reserved, must be 0)
- *    7     1  hdr_len (== IPC_HDR_SIZE)
- *    8    16  namespace, NUL padded
- *   24    32  source module, NUL padded
- *   56    32  destination module, NUL padded
- *   88     4  event
- *   92     4  payload_len
- *   96     8  req_id
- *  104     8  sender instance_id
- *  ---  ----
- *        112
+ * 报头是不含填充的定长 112 字节、显式大端、逐字段串行化。
+ * 本层是纯函数：不碰 fd、不碰上下文、除了调用者给的缓冲不写别的地方，
+ * 因此可以直接做白盒单测，不需要建 socket。
  */
 #ifndef IPC_PROTO_H
 #define IPC_PROTO_H
@@ -35,8 +18,12 @@
 
 #include "ipc/ipc.h"
 
-#define IPC_PROTO_VERSION 1u
-
+/*
+ * 反序列化后的报头。字段名用小驼峰，与文末线格式表一一对应。
+ * 注意本结构体**只用于库内部**，绝不做 struct 覆写（overlay）式收发 ——
+ * 填充字节、对齐和端序都会让两端解析不一致，而这三样在不同编译器、
+ * 不同平台上都会变。
+ */
 typedef struct {
     uint8_t  version;
     uint8_t  type;
@@ -45,65 +32,59 @@ typedef struct {
     char     src[IPC_NAME_MAX];
     char     dst[IPC_NAME_MAX];
     uint32_t event;
-    uint32_t payload_len;
-    uint64_t req_id;
-    uint64_t instance_id;
-} ipc_hdr_t;
+    uint32_t payloadLen;
+    uint64_t reqId;
+    uint64_t instanceId;
+} IpcProtoHeader;
 
-/* Serialise into buf (>= IPC_HDR_SIZE).  Returns IPC_HDR_SIZE, or 0 when an
- * argument is invalid (too-long name, bad type, oversized payload). */
-size_t ipc_hdr_encode(const ipc_hdr_t *h, uint8_t *buf, size_t cap);
-
-/* Parse.  Rejects short buffers, bad magic, bad version, bad type, non-zero
- * reserved flags, wrong hdr_len, unterminated names, empty names, unknown
- * type, and reserved type/flags combinations.  Returns IPC_OK on success. */
-int ipc_hdr_decode(const uint8_t *buf, size_t len, ipc_hdr_t *out);
-
-/* ------------------------------------------------------------------ */
-/* Credentials                                                         */
-/* ------------------------------------------------------------------ */
-
+/*
+ * 内核给的发送方凭据。**这是本库唯一的身份依据**，不可伪造：
+ * 它由内核在发送时填好，发送方自己改不了。
+ *
+ * 注意两点：
+ *   - uid 是发送方的 **real UID**。内核不提供对端的 effective UID，
+ *     所以接收侧的身份校验永远按 real UID 走，与 allowUidSplit 无关。
+ *   - pid 只用于日志诊断，**不得**用于任何授权判断（可以被复用）。
+ */
 typedef struct {
-    int   present;  /* 1 when an SCM_CREDENTIALS control message was found */
-    pid_t pid;
-    uid_t uid;
-    gid_t gid;
-} ipc_cred_t;
+    pid_t   pid;
+    uid_t   uid;
+    gid_t   gid;
+    int32_t present; /* 1 = 成功取到凭据 */
+} IpcCred;
 
-/* Extract SCM_CREDENTIALS from a received message.
+/*
+ * 序列化。成功返回 IPC_HDR_SIZE；任何字段非法返回 0。
+ * 非法清单：type 未知、version 不符、flags 非 0、payloadLen 超硬上限、
+ * ns / src / dst 有一个为空或写不下（含 NUL 后超出字段宽度）。
  *
- * Returns:
- *   IPC_OK       - out->present == 1 and fields filled
- *   IPC_ERR_CRED - no SCM_CREDENTIALS at all, or truncated / too-short one
- *   IPC_ERR_PROTO- malformed control-message walk (cmsg_len inconsistent)
+ * dst 也要求非空：接收端要拿它做「这条是不是发给我的」这一道校验，
+ * 空 dst 会让这道校验失去意义。广播是逐目标填 dst 的，不缺值。
+ */
+size_t IpcProtoEncode(const IpcProtoHeader *header, uint8_t *buf, size_t cap);
+
+/*
+ * 反序列化。接收端拒绝：短头、magic 不符、版本不符、type 未知、flags 非 0、
+ * hdrSize 不符、名字没有 NUL 结尾、名字为空、payloadLen 超硬上限。
+ * 成功返回 IPC_OK。
  *
- * `msg_flags` must be the flags returned by recvmsg(); MSG_CTRUNC is treated
- * as IPC_ERR_CRED because the credentials may have been the truncated part.
+ * 本函数**不校验** payloadLen 与实际收到的字节数是否一致 —— 那个信息在
+ * 这里拿不到，由收包层在拿到 msg_flags 与实际长度后自行比对。
+ */
+int32_t IpcProtoDecode(const uint8_t *buf, size_t len, IpcProtoHeader *out);
+
+/*
+ * 从 recvmsg 的辅助数据里取出发送方凭据。
  *
- * Takes a non-const msghdr because CMSG_FIRSTHDR/CMSG_NXTHDR are declared
- * with a non-const pointer in glibc; the function never writes through it. */
-int ipc_cred_from_msg(struct msghdr *mh, int msg_flags, ipc_cred_t *out);
+ * 失败一律返回 IPC_ERR_CRED：MSG_CTRUNC（控制缓冲被截断，凭据可能正是被切掉
+ * 的那部分，所以这里的一切都不可信）、没有控制数据、没有 SCM_CREDENTIALS
+ * 项、凭据长度不足、以及出现**多于一条**凭据（那说明有人在拼报文，
+ * 而 SO_PASSCRED 只会让内核填一条）。
+ * **宁可拒绝报文，也不要放行一个身份不明的发送方。**
+ */
+int32_t IpcProtoCredFromMsg(struct msghdr *msg, int32_t msgFlags, IpcCred *out);
 
-/* ------------------------------------------------------------------ */
-/* Reply addressing                                                    */
-/* ------------------------------------------------------------------ */
-
-struct ipc_ctx;
-
-/* Everything ipc_reply() needs to answer a IPC_TYPE_REQ.  It is derived from
- * the received header only: the *claimed* source module is used solely to look
- * up a configured path, never as proof of identity (the proof is
- * SCM_CREDENTIALS, checked before the handler runs). */
-typedef struct {
-    struct ipc_ctx *ctx;
-    char            dst[IPC_NAME_MAX];      /* reply goes here == request src */
-    uint64_t        req_id;
-    uint64_t        peer_instance;          /* echoed back to the requester  */
-    int             replied;                /* reply at most once            */
-} ipc_reply_ctx_t;
-
-/* Convenience: render a payload as a NUL-terminated, printable string in
- * `out` (truncating).  Used by the test driver and logs only. */
-void ipc_payload_to_cstr(const void *data, size_t len, char *out, size_t cap);
+/* 需要给 recvmsg 准备的控制缓冲大小：恰好放一条 ucred。 */
+#define IPC_CTRL_SIZE ((size_t)CMSG_SPACE(sizeof(struct ucred)))
 
 #endif /* IPC_PROTO_H */

@@ -1,664 +1,604 @@
+/*
+ * Copyright (c) 2026 <版权方待定>
+ * 许可协议：<待定>
+ *
+ * ipc_ctx.c -- 上下文的生命周期：注册、注销、销毁，以及诊断访问器。
+ *
+ * 本文件不碰 socket 系统调用（那些在 ipc_io.c），只负责「身份 + 状态 + 资源
+ * 归属」。拆开的理由是：注册流程要做的判断很多（配置、命名空间歧义、UID、
+ * 属组），而真正跟内核打交道的只有最后一步。
+ */
 #include <errno.h>
-#include <fcntl.h>
 #include <grp.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <sys/file.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 #include "ipc_internal.h"
 
-__thread ipc_ctx_t *ipc__tls_handler_ctx;
-
 /* ------------------------------------------------------------------ */
-/* helpers                                                             */
+/* 日志                                                               */
 /* ------------------------------------------------------------------ */
 
-static int split_path(const char *path, char *dir, size_t dcap,
-                      const char **name)
+void IpcLogEmit(const IpcContext *ctx, int32_t level, const char *format, ...)
 {
-    const char *s;
-    size_t      n;
+    const char *moduleId = NULL;
+    int32_t     effective;
+    va_list     args;
 
-    if (path == NULL || path[0] != '/') {
-        return IPC_ERR_INVAL;
+    if (format == NULL) {
+        return;
     }
-    s = strrchr(path, '/');
-    if (s == NULL || s == path) {
-        if (strcmp(path, "/") == 0) {
-            return IPC_ERR_INVAL;
-        }
-        n = 1;
+    if (ctx != NULL) {
+        moduleId = (ctx->moduleId[0] != '\0') ? ctx->moduleId : NULL;
+    }
+
+    /*
+     * 级别解析：先看本模块有没有单独设过，没有就用全局的。
+     * 过滤放在最前面 —— 连 va_list 都不构造，所以「关掉 DEBUG」是零成本，
+     * 而不是「格式化完再丢掉」。
+     */
+    if (ctx != NULL && ctx->logLevel != 0) {
+        effective = ctx->logLevel;
     } else {
-        n = (size_t)(s - path);
+        effective = IpcLogGlobalLevel();
     }
-    if (n >= dcap) {
-        return IPC_ERR_INVAL;
+    if (level < effective) {
+        return;
     }
-    memcpy(dir, path, n);
-    dir[n] = '\0';
-    *name  = s + 1;
-    if (**name == '\0') {
-        return IPC_ERR_INVAL;
+    if (level < (int32_t)IPC_LOG_DEBUG) {
+        level = (int32_t)IPC_LOG_DEBUG;
     }
-    return IPC_OK;
-}
+    if (level > (int32_t)IPC_LOG_ERROR) {
+        level = (int32_t)IPC_LOG_ERROR;
+    }
 
-/* Validate the directory that holds our socket:
- *  - exists, is a directory
- *  - owned by our UID
- *  - not writable by group or others (otherwise a hostile process in the
- *    shared group could swap our socket path for a symlink between bind()
- *    and chmod(), which we cannot close from the fd because sockfs ignores
- *    fchmod/fchown -- see probes/PROBE_NOTES.md)
- *  - searchable by us */
-static int check_own_dir(const char *dir)
-{
-    struct stat st;
-
-    if (lstat(dir, &st) != 0) {
-        IPC_LOGE("socket directory %s: %s", dir, strerror(errno));
-        return errno == ENOENT ? IPC_ERR_NOENT : ipc_errno_to_rc(errno);
+    /* 本模块有自己的出口就用它，否则退回全局出口。是覆盖关系，不是叠加。 */
+    if (ctx != NULL && ctx->logFunc != NULL) {
+        va_start(args, format);
+        ctx->logFunc((IpcLogLevel)level, moduleId, format, args, ctx->logUser);
+        va_end(args);
+        return;
     }
-    if (!S_ISDIR(st.st_mode)) {
-        IPC_LOGE("%s is not a directory", dir);
-        return IPC_ERR_PERM;
-    }
-    if (st.st_uid != geteuid()) {
-        IPC_LOGE("socket directory %s owned by uid %u, not ours (%u)", dir,
-                 (unsigned)st.st_uid, (unsigned)geteuid());
-        return IPC_ERR_PERM;
-    }
-    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
-        IPC_LOGE("socket directory %s is group/other writable (mode %04o)", dir,
-                 (unsigned)(st.st_mode & 07777));
-        return IPC_ERR_PERM;
-    }
-    if ((st.st_mode & S_IXUSR) == 0) {
-        IPC_LOGE("socket directory %s is not searchable by its owner", dir);
-        return IPC_ERR_PERM;
-    }
-    return IPC_OK;
-}
-
-/* Resolve the shared group to give the socket inode, and verify that we are
- * really a member of it.
- *
- * Rationale (handoff 5.2): holding a supplementary group does not by itself
- * decide the group of a newly created file, so the group has to be applied
- * explicitly.  Doing it through the fd would be nicer but sockfs ignores
- * fchown(), so the path form is used. */
-static int resolve_group(const char *name, gid_t *out)
-{
-    struct group *gr;
-    gid_t         groups[64];
-    int           n, i;
-
-    if (name == NULL) {
-        *out = (gid_t)-1; /* leave the process default */
-        return IPC_OK;
-    }
-    errno = 0;
-    gr    = getgrnam(name);
-    if (gr == NULL) {
-        IPC_LOGE("group '%s' not found", name);
-        return IPC_ERR_PERM;
-    }
-    *out = gr->gr_gid;
-    if (getegid() == *out) {
-        return IPC_OK;
-    }
-    n = getgroups((int)(sizeof(groups) / sizeof(groups[0])), groups);
-    if (n < 0) {
-        IPC_LOGE("getgroups: %s", strerror(errno));
-        return ipc_errno_to_rc(errno);
-    }
-    for (i = 0; i < n; i++) {
-        if (groups[i] == *out) {
-            return IPC_OK;
-        }
-    }
-    IPC_LOGE("process is not a member of group '%s' (gid %u); cannot chgrp the "
-             "socket", name, (unsigned)*out);
-    return IPC_ERR_PERM;
+    va_start(args, format);
+    IpcLogGlobalEmitVa(level, moduleId, format, args);
+    va_end(args);
 }
 
 /* ------------------------------------------------------------------ */
-/* misc accessors                                                      */
+/* 状态查询辅助                                                       */
 /* ------------------------------------------------------------------ */
 
-int ipc__check_alive(ipc_ctx_t *ctx)
+int32_t IpcCheckAlive(const IpcContext *ctx)
 {
-    if (ctx == NULL) {
-        return IPC_ERR_INVAL;
+    if (ctx == NULL || ctx->fd < 0) {
+        return IPC_ERR_STATE;
     }
-    if (atomic_load(&ctx->teardown)) {
+    if (atomic_load_explicit(&ctx->fatalError, memory_order_relaxed) != 0) {
+        return IPC_ERR_IO; /* 端点进了不可恢复的故障态 */
+    }
+    if (atomic_load_explicit(&ctx->stopped, memory_order_relaxed) != 0) {
         return IPC_ERR_STOPPED;
     }
-    if (ctx->fd < 0) {
-        return IPC_ERR_STATE;
-    }
-    if (getpid() != ctx->owner_pid) {
-        /* The context was inherited across fork().  The child must not use it:
-         * it would share the pending table and the socket with the parent.
-         * CLOEXEC only covers exec(), not fork(). */
-        return IPC_ERR_STATE;
-    }
     return IPC_OK;
 }
 
-const char *ipc__peer_path(ipc_ctx_t *ctx, const char *dst, uid_t *uid_out)
+const IpcConfigEntry *IpcPeerEntry(IpcContext *ctx, const char *dstModuleId)
 {
-    const ipc_config_entry_t *e;
-
-    e = ipc_config_lookup(ctx->cfg, ctx->ns, dst);
-    if (e == NULL) {
+    if (ctx == NULL || dstModuleId == NULL || dstModuleId[0] == '\0') {
         return NULL;
     }
-    if (uid_out != NULL) {
-        *uid_out = e->uid;
-    }
-    return e->path;
+    return IpcConfigFindModule(ctx->config, ctx->ns, dstModuleId);
 }
 
-const char *ipc_module_id(const ipc_ctx_t *ctx)
+void IpcLogIdentity(const IpcContext *ctx, const char *what)
 {
-    return ctx ? ctx->module : NULL;
-}
-
-const char *ipc_namespace(const ipc_ctx_t *ctx)
-{
-    return ctx ? ctx->ns : NULL;
-}
-
-const char *ipc_socket_path(const ipc_ctx_t *ctx)
-{
-    return ctx ? ctx->path : NULL;
-}
-
-int ipc_socket_fd(const ipc_ctx_t *ctx)
-{
-    return ctx ? ctx->fd : -1;
-}
-
-uint64_t ipc_instance_id(const ipc_ctx_t *ctx)
-{
-    return ctx ? ctx->instance_id : 0;
-}
-
-int ipc_set_handler(ipc_ctx_t *ctx, ipc_handler_fn fn, void *user)
-{
-    int rc;
-
-    if (ctx == NULL) {
-        return IPC_ERR_INVAL;
-    }
-    rc = ipc__check_alive(ctx);
-    if (rc != IPC_OK) {
-        return rc;
-    }
-    if (atomic_load(&ctx->loop_thread_started)) {
-        return IPC_ERR_STATE; /* do not swap a handler under the loop */
-    }
-    ctx->handler      = fn;
-    ctx->handler_user = user;
-    return IPC_OK;
-}
-
-void ipc_get_stats(const ipc_ctx_t *ctx, ipc_stats_t *out)
-{
-    if (out == NULL) {
-        return;
-    }
-    memset(out, 0, sizeof(*out));
     if (ctx == NULL) {
         return;
     }
-#define IPC_X(f) out->f = atomic_load_explicit(&ctx->st.f, memory_order_relaxed);
-    IPC_STAT_FIELDS(IPC_X)
-#undef IPC_X
+    IPC_LOGI(ctx, "%s: module=%s ns=%s path=%s pid=%ld instance=%016llx", what,
+             ctx->moduleId, ctx->ns, ctx->path, (long)ctx->ownerPid,
+             (unsigned long long)ctx->instanceId);
 }
 
-/* ------------------------------------------------------------------ */
-/* registration                                                        */
-/* ------------------------------------------------------------------ */
-
-static void ctx_release_resources(ipc_ctx_t *ctx, int unlink_path)
-{
-    if (ctx->epoll_fd >= 0) {
-        close(ctx->epoll_fd);
-        ctx->epoll_fd = -1;
-    }
-    if (ctx->stop_evfd >= 0) {
-        close(ctx->stop_evfd);
-        ctx->stop_evfd = -1;
-    }
-    if (ctx->fd >= 0) {
-        close(ctx->fd);
-        ctx->fd = -1;
-    }
-    if (unlink_path && ctx->path[0] != '\0') {
-        if (unlink(ctx->path) != 0 && errno != ENOENT) {
-            IPC_LOGW("could not unlink %s: %s", ctx->path, strerror(errno));
-        }
-    }
-    if (ctx->lock_fd >= 0) {
-        /* Closing releases the flocks.  The lock file itself is left in place
-         * on purpose: removing it would let a second process create a second,
-         * independent lock on the same name. */
-        close(ctx->lock_fd);
-        ctx->lock_fd = -1;
-    }
-}
-
-/* Handle a path that already exists at bind time.
+/*
+ * 启动期健康检查（ipc.h 文末 Q12 的答复）。
  *
- * We hold the exclusive lock, so no *live* registrant can exist; whatever we
- * find is residue left by a process that was killed.  Anything that is not a
- * plain socket owned by us is refused: a regular file, a directory or a
- * symlink at our socket path means something we do not understand is going
- * on, and an unconditional unlink would be a foot-gun. */
-static int handle_residue(ipc_ctx_t *ctx)
+ * 把同一个命名空间里端点路径不存在的模块**汇总成一条** WARN。
+ * 为什么不逐条打：9 个模块只起了 1 个的时候，逐条会刷 8 行，而现场需要的是
+ * 「一共有哪几个没起来」这一句话。
+ *
+ * 为什么是 WARN 不是 ERROR：启动顺序天然会经过「别人还没起来」的阶段。
+ */
+int32_t IpcWarnMissingPeers(IpcContext *ctx)
 {
-    struct stat st;
+    char    missing[512];
+    size_t  used  = 0;
+    int32_t count = 0;
+    int32_t total;
+    int32_t i;
 
-    if (lstat(ctx->path, &st) != 0) {
-        if (errno == ENOENT) {
-            return IPC_OK;
+    if (ctx == NULL || ctx->config == NULL) {
+        return 0;
+    }
+    missing[0] = '\0';
+    total      = IpcConfigGetCount(ctx->config);
+
+    for (i = 0; i < total; i++) {
+        const IpcConfigEntry *entry = IpcConfigGetEntry(ctx->config, i);
+        struct stat           st;
+
+        if (entry == NULL) {
+            continue;
         }
-        IPC_LOGE("lstat %s: %s", ctx->path, strerror(errno));
-        return ipc_errno_to_rc(errno);
+        if (strcmp(entry->ns, ctx->ns) != 0) {
+            continue; /* 只关心自己这个命名空间 */
+        }
+        if (strcmp(entry->moduleId, ctx->moduleId) == 0) {
+            continue; /* 自己不算 */
+        }
+        if (stat(entry->path, &st) == 0) {
+            continue; /* 存在 */
+        }
+        count++;
+        if (used < sizeof(missing) - 1) {
+            size_t room = sizeof(missing) - 1 - used;
+            size_t len  = IpcStrlcpy(missing + used, entry->moduleId, room + 1);
+
+            if (len > room) {
+                len = room; /* 缓冲满了：名字被截断，但计数仍然准确 */
+            }
+            used += len;
+            if (count < total && used + 2 < sizeof(missing) - 1) {
+                missing[used++]     = ',';
+                missing[used]       = '\0';
+            }
+        }
     }
-    if (!S_ISSOCK(st.st_mode)) {
-        IPC_LOGE("refusing to remove %s: not a socket (mode %06o)", ctx->path,
-                 (unsigned)(st.st_mode & 07777));
-        return IPC_ERR_PERM;
+
+    if (count > 0) {
+        IPC_LOGW(ctx, "%d configured module(s) in ns '%s' have no endpoint yet: %s",
+                 count, ctx->ns, missing);
     }
-    if (st.st_uid != geteuid()) {
-        IPC_LOGE("refusing to remove %s: owned by uid %u, not ours (%u)",
-                 ctx->path, (unsigned)st.st_uid, (unsigned)geteuid());
-        return IPC_ERR_PERM;
+    return count;
+}
+
+/* ------------------------------------------------------------------ */
+/* 接收缓冲                                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 分配接收缓冲。**尺寸只由我们自己的 maxPayload 决定**，与任何外来输入无关。
+ *
+ * 这条不变式是整库最重要的一条：如果按报头里声明的 payloadLen 去分配，
+ * 发送方只要谎报一个巨大的数字，就能让接收方按那个数字去 malloc。
+ * 超长报文交给 recvmsg 的 MSG_TRUNC 检测，不需要先把它们收下来。
+ */
+static int32_t AllocRecvBuffers(IpcContext *ctx)
+{
+    ctx->recvBufSize = (size_t)IPC_HDR_SIZE + (size_t)ctx->maxPayload;
+    ctx->recvBuf     = (uint8_t *)calloc(1, ctx->recvBufSize);
+    ctx->ctrlBuf     = (uint8_t *)calloc(1, IPC_CTRL_SIZE);
+    if (ctx->recvBuf == NULL || ctx->ctrlBuf == NULL) {
+        free(ctx->recvBuf);
+        free(ctx->ctrlBuf);
+        ctx->recvBuf = NULL;
+        ctx->ctrlBuf = NULL;
+        return IPC_ERR_NOMEM;
     }
-    IPC_LOGW("removing stale socket residue at %s", ctx->path);
-    if (unlink(ctx->path) != 0) {
-        IPC_LOGE("unlink %s: %s", ctx->path, strerror(errno));
-        return ipc_errno_to_rc(errno);
+    ctx->recvPayload = ctx->recvBuf + IPC_HDR_SIZE;
+
+    /*
+     * msg 骨架在这里建一次、之后复用：只有 msg_control / msg_controllen /
+     * msg_flags 需要每条报文复位（recvmsg 会就地改写它们）。
+     * 刻意不填 msg_name/msg_namelen —— 我们不关心对端的**地址**，
+     * 身份一律以内核凭据为准，地址在这里没有任何授权含义。
+     */
+    ctx->recvIov.iov_base = ctx->recvBuf;
+    ctx->recvIov.iov_len  = ctx->recvBufSize;
+    memset(&ctx->recvMsg, 0, sizeof(ctx->recvMsg));
+    ctx->recvMsg.msg_iov    = &ctx->recvIov;
+    ctx->recvMsg.msg_iovlen = 1;
+    return IPC_OK;
+}
+
+static void FreeRecvBuffers(IpcContext *ctx)
+{
+    free(ctx->recvBuf);
+    free(ctx->ctrlBuf);
+    ctx->recvBuf     = NULL;
+    ctx->ctrlBuf     = NULL;
+    ctx->recvPayload = NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* 注册                                                               */
+/* ------------------------------------------------------------------ */
+
+/* 从调用者给的选项里解析出名字字段，失败时统一走清理路径。 */
+static int32_t CopyOptionStrings(IpcContext *ctx, const IpcModuleOptions *options)
+{
+    if (options->moduleId == NULL || options->moduleId[0] == '\0') {
+        return IPC_ERR_INVAL;
+    }
+    if (IpcStrlcpy(ctx->moduleId, options->moduleId, sizeof(ctx->moduleId)) >=
+        sizeof(ctx->moduleId)) {
+        return IPC_ERR_INVAL; /* 名字超长 */
+    }
+    if (options->groupName != NULL && options->groupName[0] != '\0') {
+        if (IpcStrlcpy(ctx->groupName, options->groupName, sizeof(ctx->groupName)) >=
+            sizeof(ctx->groupName)) {
+            return IPC_ERR_INVAL;
+        }
     }
     return IPC_OK;
 }
 
-int ipc_register(const ipc_register_opts_t *opts, ipc_ctx_t **out)
+/*
+ * 按配置表推导命名空间：只找到唯一一处同名模块时取它的 ns，找到多处报歧义。
+ * 这正是 examples/README.md 里 `conf/02-two-namespaces.conf` 要测的场景。
+ */
+static int32_t DeriveNamespace(IpcContext *ctx, const char *moduleId)
 {
-    ipc_ctx_t                *ctx = NULL;
-    const ipc_config_entry_t *ent = NULL;
-    const char               *conf_path;
-    char                      dir[IPC_SUN_PATH_MAX];
-    const char               *name = NULL;
-    struct sockaddr_un        sun;
-    gid_t                     gid = (gid_t)-1;
-    mode_t                    old_umask;
-    int                       rc;
-    int                       i;
-    int                       matches = 0;
+    const IpcConfigEntry *found = NULL;
+    int32_t               total;
+    int32_t               i;
 
-    if (out == NULL || opts == NULL || opts->module == NULL ||
-        opts->module[0] == '\0') {
+    total = IpcConfigGetCount(ctx->config);
+    for (i = 0; i < total; i++) {
+        const IpcConfigEntry *entry = IpcConfigGetEntry(ctx->config, i);
+
+        if (entry == NULL || strcmp(entry->moduleId, moduleId) != 0) {
+            continue;
+        }
+        if (found != NULL) {
+            IpcLogGlobalEmit(IPC_LOG_WARN, moduleId,
+                             "module id appears in more than one namespace; "
+                             "set IpcModuleOptions.ns explicitly");
+            return IPC_ERR_CONFIG;
+        }
+        found = entry;
+    }
+    if (found == NULL) {
+        return IPC_ERR_NOENT;
+    }
+    (void)IpcStrlcpy(ctx->ns, found->ns, sizeof(ctx->ns));
+    return IPC_OK;
+}
+
+/*
+ * 注册时的身份自检。
+ *
+ * **这不是安全边界**，只是防误用：真正的强制保护来自目录/文件权限，以及
+ * 接收端的凭据校验。这里的意义是让「以错误的身份启动」在启动时就暴露，
+ * 而不是等到第一条报文被对端拒绝。
+ *
+ * allowUidSplit == 0：real / effective / 配置 UID 三者必须一致。
+ * allowUidSplit == 1：只比 effective（为 setuid 场景放宽）。
+ *
+ * 注意接收侧**没有**这个开关：内核 SCM_CREDENTIALS 只给对端的 real UID。
+ */
+static int32_t CheckOwnIdentity(const IpcContext *ctx, uid_t authorizedUid,
+                               int32_t allowUidSplit)
+{
+    uid_t real = ctx->realUid;
+    uid_t eff  = geteuid();
+
+    if (allowUidSplit != 0) {
+        if (eff != authorizedUid) {
+            IPC_LOGE(ctx,
+                     "uid self-check failed: effective uid %u != authorized uid %u",
+                     (unsigned)eff, (unsigned)authorizedUid);
+            return IPC_ERR_PERM;
+        }
+        return IPC_OK;
+    }
+    if (real != authorizedUid || eff != authorizedUid) {
+        IPC_LOGE(ctx,
+                 "uid self-check failed: real=%u effective=%u authorized=%u "
+                 "(allowUidSplit=0 requires all three to match)",
+                 (unsigned)real, (unsigned)eff, (unsigned)authorizedUid);
+        return IPC_ERR_PERM;
+    }
+    return IPC_OK;
+}
+
+int32_t IpcRegister(const IpcModuleOptions *options, IpcContext **outContext)
+{
+    IpcContext           *ctx;
+    const IpcConfigEntry *entry;
+    const char           *confPath;
+    int32_t               rc;
+
+    if (options == NULL || outContext == NULL) {
         return IPC_ERR_INVAL;
     }
-    *out = NULL;
-    if (strlen(opts->module) >= IPC_NAME_MAX) {
-        return IPC_ERR_INVAL;
-    }
+    *outContext = NULL;
 
-    ctx = calloc(1, sizeof(*ctx));
+    ctx = (IpcContext *)calloc(1, sizeof(*ctx));
     if (ctx == NULL) {
         return IPC_ERR_NOMEM;
     }
-    ctx->fd        = -1;
-    ctx->lock_fd   = -1;
-    ctx->epoll_fd  = -1;
-    ctx->stop_evfd = -1;
-    ctx->owner_pid = getpid();
-    ipc_strlcpy(ctx->module, opts->module, sizeof(ctx->module));
+    ctx->fd       = -1;
+    ctx->lockFd   = -1;
 
-    /* ---- options, defaults and clamping --------------------------- */
-    ctx->opt                     = *opts;
-    ctx->opt.dispatch            = (opts->dispatch == IPC_DISPATCH_POOL)
-                                       ? IPC_DISPATCH_POOL
-                                       : IPC_DISPATCH_INLINE;
-    ctx->opt.workers             = opts->workers > 0 ? opts->workers : 2;
-    if (ctx->opt.workers > 8) {
-        ctx->opt.workers = 8;
-    }
-    ctx->opt.cb_queue_max        = opts->cb_queue_max > 0 ? opts->cb_queue_max
-                                                         : 64;
-    ctx->opt.max_pending         = opts->max_pending > 0 ? opts->max_pending
-                                                        : 64;
-    ctx->max_payload             = opts->max_payload ? opts->max_payload
-                                                     : IPC_PAYLOAD_DEFAULT;
-    if (ctx->max_payload > IPC_PAYLOAD_HARD_MAX) {
-        ctx->max_payload = IPC_PAYLOAD_HARD_MAX;
-    }
-    ctx->opt.max_payload         = ctx->max_payload;
-    ctx->opt.broadcast_include_self = opts->broadcast_include_self ? 1 : 0;
-    ctx->opt.allow_uid_split     = opts->allow_uid_split ? 1 : 0;
-
-    if (pthread_mutex_init(&ctx->life_lock, NULL) != 0 ||
-        pthread_cond_init(&ctx->life_cv, NULL) != 0) {
-        rc = IPC_ERR_IO;
-        goto fail;
-    }
-
-    /* ---- static module table -------------------------------------- */
-    conf_path = ctx->opt.conf_path ? ctx->opt.conf_path : IPC_CONF_DEFAULT;
-    rc        = ipc_config_load(conf_path, &ctx->cfg);
+    rc = CopyOptionStrings(ctx, options);
     if (rc != IPC_OK) {
-        goto fail;
-    }
-    for (i = 0; i < ipc_config_count(ctx->cfg); i++) {
-        const ipc_config_entry_t *e = ipc_config_at(ctx->cfg, i);
-        if (strcmp(e->module, ctx->module) != 0) {
-            continue;
-        }
-        if (ctx->opt.ns != NULL && strcmp(e->ns, ctx->opt.ns) != 0) {
-            continue;
-        }
-        ent = e;
-        matches++;
-    }
-    if (matches == 0) {
-        IPC_LOGE("module '%s' is not in %s", ctx->module, conf_path);
-        rc = IPC_ERR_NOENT;
-        goto fail;
-    }
-    if (matches > 1) {
-        IPC_LOGE("module id '%s' occurs in %d namespaces of %s; pass opts.ns",
-                 ctx->module, matches, conf_path);
-        rc = IPC_ERR_CONFIG;
-        goto fail;
-    }
-    ipc_strlcpy(ctx->ns, ent->ns, sizeof(ctx->ns));
-    ipc_strlcpy(ctx->path, ent->path, sizeof(ctx->path));
-    ctx->uid = ent->uid;
-    snprintf(ctx->lock_path, sizeof(ctx->lock_path), "%s.lock", ctx->path);
-
-    /* ---- identity -------------------------------------------------- */
-    /* Default policy: real UID, effective UID and the configured UID must all
-     * agree.  Allowing them to differ would make the credentials peers see
-     * (SCM_CREDENTIALS, see probes/PROBE_NOTES.md) differ from the identity
-     * checked here.  allow_uid_split=1 relaxes this to the effective UID. */
-    if (!ctx->opt.allow_uid_split) {
-        if (getuid() != ent->uid || geteuid() != ent->uid) {
-            IPC_LOGE("uid mismatch for module %s: config=%u real=%u effective=%u",
-                     ctx->module, (unsigned)ent->uid, (unsigned)getuid(),
-                     (unsigned)geteuid());
-            rc = IPC_ERR_PERM;
-            goto fail;
-        }
-    } else if (geteuid() != ent->uid) {
-        IPC_LOGE("effective uid %u cannot register module %s (config uid=%u)",
-                 (unsigned)geteuid(), ctx->module, (unsigned)ent->uid);
-        rc = IPC_ERR_PERM;
-        goto fail;
+        IPC_LOGE(ctx, "invalid IpcModuleOptions (moduleId missing or too long)");
+        goto Fail;
     }
 
-    /* ---- directory, group ----------------------------------------- */
-    rc = split_path(ctx->path, dir, sizeof(dir), &name);
-    if (rc != IPC_OK) {
-        IPC_LOGE("bad socket path in config: %s", ctx->path);
-        goto fail;
-    }
-    (void)name;
-    rc = check_own_dir(dir);
-    if (rc != IPC_OK) {
-        goto fail;
-    }
-    rc = resolve_group(ctx->opt.group, &gid);
-    if (rc != IPC_OK) {
-        goto fail;
-    }
-
-    /* ---- lifetime lock -------------------------------------------- */
-    ctx->lock_fd = open(ctx->lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (ctx->lock_fd < 0) {
-        IPC_LOGE("cannot open lock file %s: %s", ctx->lock_path,
-                 strerror(errno));
-        rc = ipc_errno_to_rc(errno);
-        goto fail;
-    }
-    if (flock(ctx->lock_fd, LOCK_EX | LOCK_NB) != 0) {
-        IPC_LOGE("module %s is already registered (lock %s held): %s",
-                 ctx->module, ctx->lock_path, strerror(errno));
-        rc = (errno == EWOULDBLOCK) ? IPC_ERR_BUSY : ipc_errno_to_rc(errno);
-        goto fail;
-    }
-
-    /* ---- residue, must happen while the lock is held ---------------- */
-    rc = handle_residue(ctx);
-    if (rc != IPC_OK) {
-        goto fail;
-    }
-
-    /* ---- socket ---------------------------------------------------- */
-    ctx->fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (ctx->fd < 0) {
-        IPC_LOGE("socket(AF_UNIX, SOCK_DGRAM): %s", strerror(errno));
-        rc = ipc_errno_to_rc(errno);
-        goto fail;
-    }
+    /*
+     * 载荷上限的两步串联：先补缺省，再压天花板。
+     * 顺序不能反，否则会出现「默认值本身超上限」这种自相矛盾的结果。
+     */
     {
-        int one = 1;
-        if (setsockopt(ctx->fd, SOL_SOCKET, SO_PASSCRED, &one, sizeof(one)) !=
-            0) {
-            IPC_LOGE("SO_PASSCRED: %s", strerror(errno));
-            rc = ipc_errno_to_rc(errno);
-            goto fail;
-        }
-    }
-    if (ctx->opt.sndbuf > 0 &&
-        setsockopt(ctx->fd, SOL_SOCKET, SO_SNDBUF, &ctx->opt.sndbuf,
-                   sizeof(ctx->opt.sndbuf)) != 0) {
-        IPC_LOGW("SO_SNDBUF=%d: %s", ctx->opt.sndbuf, strerror(errno));
-    }
-    if (ctx->opt.rcvbuf > 0) {
-        int eff = 0;
-        socklen_t el = sizeof(eff);
-        if (setsockopt(ctx->fd, SOL_SOCKET, SO_RCVBUF, &ctx->opt.rcvbuf,
-                       sizeof(ctx->opt.rcvbuf)) != 0) {
-            IPC_LOGW("SO_RCVBUF=%d: %s", ctx->opt.rcvbuf, strerror(errno));
-        } else if (getsockopt(ctx->fd, SOL_SOCKET, SO_RCVBUF, &eff, &el) == 0) {
-            IPC_LOGW("SO_RCVBUF=%d requested (kernel reports %d) -- measured "
-                     "behaviour: on AF_UNIX datagram sockets this does NOT set "
-                     "the receive-queue depth, see probes/PROBE_NOTES.md",
-                     ctx->opt.rcvbuf, eff);
-        }
-    }
+        uint32_t want = (options->maxPayload != 0) ? options->maxPayload
+                                                   : (uint32_t)IPC_PAYLOAD_DEFAULT;
 
-    memset(&sun, 0, sizeof(sun));
-    sun.sun_family = AF_UNIX;
-    memcpy(sun.sun_path, ctx->path, strlen(ctx->path) + 1);
-    /* The socket is created by bind() with (0777 & ~umask).  Tighten the umask
-     * so it is never group/other writable, not even for the microseconds
-     * between bind() and chmod().  sockfs ignores fchmod()/fchown(), so the
-     * path forms below are the only ones that actually take effect. */
-    old_umask = umask(0077);
-    rc = bind(ctx->fd, (struct sockaddr *)&sun,
-              (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
-                          strlen(ctx->path) + 1));
-    umask(old_umask);
-    if (rc != 0) {
-        IPC_LOGE("bind %s: %s", ctx->path, strerror(errno));
-        rc = ipc_errno_to_rc(errno);
-        goto fail;
+        if (want > (uint32_t)IPC_PAYLOAD_HARD_MAX) {
+            want = (uint32_t)IPC_PAYLOAD_HARD_MAX;
+        }
+        ctx->maxPayload = want;
     }
-    ctx->bounds_created = 1;
+    ctx->allowUidSplit         = options->allowUidSplit;
+    ctx->broadcastIncludeSelf  = options->broadcastIncludeSelf;
+    ctx->sndBufSize            = options->sendBufSize;
+    ctx->rcvBufSize            = options->recvBufSize;
+    ctx->dispatch              = options->dispatch;
+    ctx->dispatchUser          = options->dispatchUser;
+    ctx->logFunc               = options->log;
+    ctx->logUser               = options->logUser;
+    ctx->logLevel              = options->logLevel;
+    ctx->realUid               = getuid();
+    ctx->ownerPid              = getpid();
 
-    if (gid != (gid_t)-1 && chown(ctx->path, (uid_t)-1, gid) != 0) {
-        IPC_LOGE("chown %s to gid %u: %s", ctx->path, (unsigned)gid,
-                 strerror(errno));
-        rc = ipc_errno_to_rc(errno);
-        goto fail;
-    }
-    if (chmod(ctx->path, 0620) != 0) {
-        IPC_LOGE("chmod %s: %s", ctx->path, strerror(errno));
-        rc = ipc_errno_to_rc(errno);
-        goto fail;
-    }
-    {
-        /* Verify what actually landed on the filesystem.  Cheap, and it turns
-         * a silent permission surprise into a loud failure. */
-        struct stat st;
-        if (lstat(ctx->path, &st) != 0) {
-            rc = ipc_errno_to_rc(errno);
-            goto fail;
-        }
-        if (!S_ISSOCK(st.st_mode) || (st.st_mode & 07777) != 0620 ||
-            st.st_uid != geteuid() ||
-            (gid != (gid_t)-1 && st.st_gid != gid)) {
-            IPC_LOGE("socket %s has unexpected attributes: mode %04o uid %u "
-                     "gid %u (wanted socket 0620 uid %u gid %d)", ctx->path,
-                     (unsigned)(st.st_mode & 07777), (unsigned)st.st_uid,
-                     (unsigned)st.st_gid, (unsigned)geteuid(), (int)gid);
-            rc = IPC_ERR_PERM;
-            goto fail;
-        }
-    }
-
-    /* ---- receive plumbing ------------------------------------------ */
-    ctx->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (ctx->epoll_fd < 0) {
-        rc = ipc_errno_to_rc(errno);
-        goto fail;
-    }
-    ctx->stop_evfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (ctx->stop_evfd < 0) {
-        rc = ipc_errno_to_rc(errno);
-        goto fail;
-    }
-    {
-        struct epoll_event ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.events  = EPOLLIN;
-        ev.data.fd = ctx->fd;
-        if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->fd, &ev) != 0) {
-            rc = ipc_errno_to_rc(errno);
-            goto fail;
-        }
-        ev.events  = EPOLLIN;
-        ev.data.fd = ctx->stop_evfd;
-        if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->stop_evfd, &ev) != 0) {
-            rc = ipc_errno_to_rc(errno);
-            goto fail;
-        }
-    }
-
-    rc = ipc_pending_init(&ctx->pend, ctx->opt.max_pending);
+    /* 1) 配置表。 */
+    confPath = (options->confPath != NULL) ? options->confPath : IPC_CONF_DEFAULT;
+    rc       = IpcConfigLoad(confPath, &ctx->config);
     if (rc != IPC_OK) {
-        goto fail;
+        IPC_LOGE(ctx, "cannot load module table '%s': %s", confPath,
+                 IpcResultToString(rc));
+        goto Fail;
     }
-    rc = ipc_queue_init(&ctx->queue, ctx->opt.cb_queue_max);
-    if (rc != IPC_OK) {
-        goto fail;
-    }
-    if (ctx->opt.dispatch == IPC_DISPATCH_POOL) {
-        rc = ipc_loop_start_workers(ctx);
+
+    /* 2) 命名空间：显式给了就用，没给就按模块名唯一推导。 */
+    if (options->ns != NULL && options->ns[0] != '\0') {
+        if (IpcStrlcpy(ctx->ns, options->ns, sizeof(ctx->ns)) >= sizeof(ctx->ns)) {
+            rc = IPC_ERR_INVAL;
+            goto Fail;
+        }
+    } else {
+        rc = DeriveNamespace(ctx, ctx->moduleId);
         if (rc != IPC_OK) {
-            goto fail;
+            IPC_LOGE(ctx, "cannot derive namespace for '%s': %s", ctx->moduleId,
+                     IpcResultToString(rc));
+            goto Fail;
         }
     }
 
-    ctx->instance_id = ipc_gen_instance_id();
-    IPC_LOGI("module %s/%s registered on %s (uid=%u instance=0x%016llx "
-             "dispatch=%s payload_max=%u)",
-             ctx->ns, ctx->module, ctx->path, (unsigned)geteuid(),
-             (unsigned long long)ctx->instance_id,
-             ctx->opt.dispatch == IPC_DISPATCH_POOL ? "pool" : "inline",
-             ctx->max_payload);
-    *out = ctx;
+    /* 3) 查表。查不到就是「配置里没有这个模块」，不是「对端离线」。 */
+    entry = IpcConfigFindModule(ctx->config, ctx->ns, ctx->moduleId);
+    if (entry == NULL) {
+        IPC_LOGE(ctx, "module '%s' is not declared in ns '%s'", ctx->moduleId, ctx->ns);
+        rc = IPC_ERR_NOENT;
+        goto Fail;
+    }
+    (void)IpcStrlcpy(ctx->path, entry->path, sizeof(ctx->path));
+    ctx->authorizedUid = entry->uid;
+
+    /* 4) 身份自检。 */
+    rc = CheckOwnIdentity(ctx, ctx->authorizedUid, ctx->allowUidSplit);
+    if (rc != IPC_OK) {
+        goto Fail;
+    }
+
+    /* 5) 属组（可选）。 */
+    if (ctx->groupName[0] != '\0') {
+        struct group *gr = getgrnam(ctx->groupName);
+
+        if (gr == NULL) {
+            IPC_LOGE(ctx, "group '%s' does not exist", ctx->groupName);
+            rc = IPC_ERR_NOENT;
+            goto Fail;
+        }
+        ctx->groupGid  = gr->gr_gid;
+        ctx->haveGroup = 1;
+    }
+
+    ctx->instanceId = IpcGenInstanceId();
+
+    /* 6) 接收缓冲。必须在返回成功之前就绪，否则 IpcHandleReadable 会拒绝工作。 */
+    rc = AllocRecvBuffers(ctx);
+    if (rc != IPC_OK) {
+        goto Fail;
+    }
+
+    /* 7) 等待表。abortFlag 指向 stopped，IpcRequestStop 一翻它，
+     *    所有等待者立刻从 IpcPendingWait 里出来。 */
+    rc = IpcPendingInit(&ctx->pending, options->maxPending, &ctx->stopped);
+    if (rc != IPC_OK) {
+        goto Fail;
+    }
+    ctx->pendingCreated = 1;
+
+    if (pthread_mutex_init(&ctx->lifeLock, NULL) != 0) {
+        rc = IPC_ERR_IO;
+        goto Fail;
+    }
+    ctx->lifeLockCreated = 1;
+    if (pthread_cond_init(&ctx->lifeCv, NULL) != 0) {
+        rc = IPC_ERR_IO;
+        goto Fail;
+    }
+    ctx->lifeCvCreated = 1;
+
+    /* 8) 真正跟内核打交道的那一步。 */
+    rc = IpcIoCreateEndpoint(ctx);
+    if (rc != IPC_OK) {
+        goto Fail;
+    }
+
+    /* 9) 启动期健康检查：同命名空间里还没起来的模块，一条 WARN 说清楚。 */
+    (void)IpcWarnMissingPeers(ctx);
+
+    *outContext = ctx;
     return IPC_OK;
 
-fail:
-    if (ctx != NULL) {
-        ipc_loop_shutdown_workers(ctx);
-        ctx_release_resources(ctx, ctx->bounds_created);
-        if (ctx->pend.slots != NULL) {
-            ipc_pending_destroy(&ctx->pend);
-        }
-        if (ctx->queue.items != NULL) {
-            ipc_queue_destroy(&ctx->queue);
-        }
-        pthread_cond_destroy(&ctx->life_cv);
-        pthread_mutex_destroy(&ctx->life_lock);
-        if (ctx->cfg != NULL) {
-            ipc_config_free(ctx->cfg);
-        }
-        free(ctx);
+Fail:
+    /*
+     * 完整回滚：任何一步失败都不留半成品。
+     * IpcIoCreateEndpoint 失败时内部已经把自己建过的东西收干净了，
+     * 所以这里只需要处理本函数自己申请的。
+     */
+    IpcIoDestroyEndpoint(ctx);
+    if (ctx->lifeCvCreated) {
+        (void)pthread_cond_destroy(&ctx->lifeCv);
     }
+    if (ctx->lifeLockCreated) {
+        (void)pthread_mutex_destroy(&ctx->lifeLock);
+    }
+    if (ctx->pendingCreated) {
+        IpcPendingDestroy(&ctx->pending);
+    }
+    FreeRecvBuffers(ctx);
+    IpcConfigDestroy(ctx->config);
+    free(ctx);
     return rc;
 }
 
-int ipc_unregister(ipc_ctx_t *ctx)
-{
-    int rc;
+/* ------------------------------------------------------------------ */
+/* 注销与销毁                                                         */
+/* ------------------------------------------------------------------ */
 
+int32_t IpcUnregister(IpcContext *ctx)
+{
     if (ctx == NULL) {
         return IPC_ERR_INVAL;
     }
-    if (atomic_exchange(&ctx->teardown, 1)) {
-        return IPC_OK; /* already tearing down / torn down: idempotent */
+    if (atomic_load_explicit(&ctx->teardownDone, memory_order_acquire) != 0) {
+        return IPC_OK; /* 已经拆完了，幂等 */
     }
-    if (ctx->fd >= 0 && getpid() != ctx->owner_pid) {
-        /* A forked child must not tear the parent's context down. */
+
+    (void)pthread_mutex_lock(&ctx->lifeLock);
+    if (atomic_load_explicit(&ctx->teardownStarted, memory_order_relaxed) == 0) {
+        /*
+         * 第一个调用者干活。守卫必须建立在**对象还活着的时候**：
+         * 早期版本用「标记 + 之后 free」，导致连调两次就是 use-after-free
+         * （ASan 复现过）。本函数绝不 free，free 只在 IpcDestroy 里。
+         */
+        atomic_store_explicit(&ctx->teardownStarted, 1, memory_order_relaxed);
+        (void)pthread_mutex_unlock(&ctx->lifeLock);
+
+        /* 1) 停止接活。 */
+        atomic_store_explicit(&ctx->stopped, 1, memory_order_release);
+
+        /* 2) 了结挂起的同步请求：先广播唤醒，再等它们真正退出等待。 */
+        IpcPendingWakeAll(&ctx->pending);
+        IpcPendingWaitDrained(&ctx->pending);
+
+        /* 3) 关 fd → 持锁 unlink → 放锁（都在 IpcIoDestroyEndpoint 里）。 */
+        IpcIoDestroyEndpoint(ctx);
+
+        /* 4) 配置表与接收缓冲都是本实例私有的，可以释放。 */
+        FreeRecvBuffers(ctx);
+        IpcConfigDestroy(ctx->config);
+        ctx->config = NULL;
+
+        (void)pthread_mutex_lock(&ctx->lifeLock);
+        atomic_store_explicit(&ctx->teardownDone, 1, memory_order_release);
+        (void)pthread_cond_broadcast(&ctx->lifeCv);
+        (void)pthread_mutex_unlock(&ctx->lifeLock);
+        IpcLogGlobalEmit(IPC_LOG_INFO, ctx->moduleId, "unregistered");
+        return IPC_OK;
+    }
+    /* 别的线程正在拆：等到它拆完再返回，这样「我返回了」就等于「资源已释放」。 */
+    while (atomic_load_explicit(&ctx->teardownDone, memory_order_acquire) == 0) {
+        (void)pthread_cond_wait(&ctx->lifeCv, &ctx->lifeLock);
+    }
+    (void)pthread_mutex_unlock(&ctx->lifeLock);
+    return IPC_OK;
+}
+
+int32_t IpcDestroy(IpcContext *ctx)
+{
+    if (ctx == NULL) {
+        return IPC_ERR_INVAL;
+    }
+    if (atomic_load_explicit(&ctx->teardownDone, memory_order_acquire) == 0) {
+        /* 契约：只能在 IpcUnregister 完成之后调用。这里什么都不释放。 */
         return IPC_ERR_STATE;
     }
-
-    /* 1. stop taking part in the protocol */
-    ipc_stop(ctx);
-
-    /* 2. let the loop thread notice and finish */
-    pthread_mutex_lock(&ctx->life_lock);
-    while (atomic_load(&ctx->loop_thread_started)) {
-        pthread_cond_wait(&ctx->life_cv, &ctx->life_lock);
-    }
-    pthread_mutex_unlock(&ctx->life_lock);
-    if (ctx->have_loop_thread) {
-        pthread_join(ctx->loop_thread, NULL);
-        ctx->have_loop_thread = 0;
-    }
-
-    /* 3. drain the callback queue, then stop the workers */
-    {
-        ipc_task_t t;
-        while (ipc_queue_pop(&ctx->queue, &t, 0) == IPC_OK) {
-            ipc_task_clear(&t);
-        }
-    }
-    ipc_loop_shutdown_workers(ctx);
-
-    /* 4. resolve outstanding synchronous requests (waiters wake with
-     *    IPC_ERR_STOPPED) */
-    ipc_pending_shutdown(&ctx->pend);
-
-    /* 5. close the socket, then clean the path while still holding the lock */
-    rc = IPC_OK;
-    ctx_release_resources(ctx, ctx->bounds_created);
-
-    /* 6. the lock is now released; destroy the rest */
-    ipc_pending_destroy(&ctx->pend);
-    ipc_queue_destroy(&ctx->queue);
-    pthread_cond_destroy(&ctx->life_cv);
-    pthread_mutex_destroy(&ctx->life_lock);
-    if (ctx->cfg != NULL) {
-        ipc_config_free(ctx->cfg);
-        ctx->cfg = NULL;
-    }
-    IPC_LOGI("module %s/%s unregistered", ctx->ns, ctx->module);
+    IpcPendingDestroy(&ctx->pending);
+    (void)pthread_cond_destroy(&ctx->lifeCv);
+    (void)pthread_mutex_destroy(&ctx->lifeLock);
     free(ctx);
-    return rc;
+    return IPC_OK;
+}
+
+int32_t IpcRequestStop(IpcContext *ctx)
+{
+    if (ctx == NULL) {
+        return IPC_ERR_INVAL;
+    }
+    atomic_store_explicit(&ctx->stopped, 1, memory_order_release);
+    IpcPendingWakeAll(&ctx->pending); /* 唤醒所有在 IpcSend 里等回复的线程 */
+    return IPC_OK;
+}
+
+int32_t IpcIsStopped(const IpcContext *ctx)
+{
+    if (ctx == NULL) {
+        return 1;
+    }
+    if (ctx->fd < 0) {
+        return 1;
+    }
+    return (atomic_load_explicit(&ctx->stopped, memory_order_relaxed) != 0) ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* 诊断访问器                                                         */
+/* ------------------------------------------------------------------ */
+
+const char *IpcGetModuleId(const IpcContext *ctx)
+{
+    return (ctx != NULL) ? ctx->moduleId : NULL;
+}
+
+const char *IpcGetNamespace(const IpcContext *ctx)
+{
+    return (ctx != NULL) ? ctx->ns : NULL;
+}
+
+const char *IpcGetSocketPath(const IpcContext *ctx)
+{
+    return (ctx != NULL) ? ctx->path : NULL;
+}
+
+uint64_t IpcGetInstanceId(const IpcContext *ctx)
+{
+    return (ctx != NULL) ? ctx->instanceId : 0;
+}
+
+int32_t IpcGetStatistics(const IpcContext *ctx, IpcStatistics *outStatistics)
+{
+    if (ctx == NULL || outStatistics == NULL) {
+        return IPC_ERR_INVAL;
+    }
+    memset(outStatistics, 0, sizeof(*outStatistics));
+/*
+ * 用同一份字段表生成快照。relaxed 就够了：统计是**只增计数器**，
+ * 单个字段本身的读是原子的；但整体不是一个一致快照，所以 ipc.h 里
+ * 明确写了「只用于日志和测试断言」。
+ * C11 的 atomic_load_explicit 接受 const volatile 指针，所以 ctx 的
+ * const 属性在这里不需要被强转掉。
+ */
+#define IPC_STAT_SNAPSHOT(field)                                               \
+    outStatistics->field =                                                      \
+        atomic_load_explicit(&ctx->st.field, memory_order_relaxed);
+    IPC_STAT_FIELDS(IPC_STAT_SNAPSHOT)
+#undef IPC_STAT_SNAPSHOT
+    return IPC_OK;
 }

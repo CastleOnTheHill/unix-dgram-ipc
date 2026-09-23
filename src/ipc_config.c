@@ -1,73 +1,146 @@
+/*
+ * Copyright (c) 2026 <版权方待定>
+ * 许可协议：<待定>
+ *
+ * ipc_config.c -- 静态模块表的解析与查找。
+ *
+ * 规范细节以 examples/README.md 为准，本文件与它必须逐条一致。
+ * 本文件是**纯逻辑**：不建 socket、不碰上下文，可以整体做白盒单测。
+ */
 #include "ipc_config.h"
 
-#include <ctype.h>
-#include <errno.h>
-#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "ipc_log.h"
 #include "ipc_util.h"
 
 /* ------------------------------------------------------------------ */
-/* line parser                                                         */
+/* 字符集判定                                                         */
 /* ------------------------------------------------------------------ */
 
-static int parse_uid(const char *s, uid_t *out)
+/*
+ * 刻意不用 isalnum()：它受 locale 影响，在非 C locale 下可能把非 ASCII 的
+ * 字母也判为「字母」，于是配置解析结果会随环境变量而变。这里按显式范围判断，
+ * 结果与 locale 无关。
+ */
+static int32_t IsAsciiAlnum(char c)
+{
+    return ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+               ? 1
+               : 0;
+}
+
+static int32_t IsNsChar(char c)
+{
+    return (IsAsciiAlnum(c) || c == '_' || c == '-') ? 1 : 0;
+}
+
+static int32_t IsModuleChar(char c)
+{
+    return (IsAsciiAlnum(c) || c == '_' || c == '-' || c == '.') ? 1 : 0;
+}
+
+static int32_t IsBlank(char c)
+{
+    return (c == ' ' || c == '\t' || c == '\v' || c == '\f' || c == '\r') ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* 行处理                                                             */
+/* ------------------------------------------------------------------ */
+
+size_t IpcConfigStripEol(char *line)
+{
+    size_t n;
+
+    if (line == NULL) {
+        return 0;
+    }
+    n = strlen(line);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+        line[--n] = '\0';
+    }
+    return n;
+}
+
+/*
+ * uid：只接受纯十进制。刻意拒绝首字符为 '+' '-' 或空白，
+ * 也拒绝尾随垃圾（"100 " 在切分阶段就已经被切成 "100"，这里只处理
+ * 真正的越界值）。
+ */
+static int32_t ParseUid(const char *text, uid_t *out)
 {
     char          *end = NULL;
-    unsigned long  v;
+    unsigned long  value;
 
-    if (s == NULL || *s == '\0') {
+    if (text == NULL || text[0] == '\0') {
         return IPC_ERR_CONFIG;
     }
-    if (!isdigit((unsigned char)s[0])) {
-        return IPC_ERR_CONFIG; /* reject leading '+', '-', space */
+    if (text[0] < '0' || text[0] > '9') {
+        return IPC_ERR_CONFIG;
     }
-    errno = 0;
-    v = strtoul(s, &end, 10);
-    if (errno != 0 || end == s || *end != '\0') {
+    value = strtoul(text, &end, 10);
+    if (end == text || *end != '\0') {
         return IPC_ERR_CONFIG;
     }
 #ifdef UID_MAX
-    if (v > (unsigned long)UID_MAX) {
+    if (value > (unsigned long)UID_MAX) {
         return IPC_ERR_CONFIG;
     }
 #else
-    if (v > 4294967294ul) {
+    if (value > 4294967294ul) {
         return IPC_ERR_CONFIG;
     }
 #endif
-    *out = (uid_t)v;
+    *out = (uid_t)value;
     return IPC_OK;
 }
 
-int ipc_config_parse_line(char *line, ipc_config_entry_t *out, int lineno)
+static int32_t CheckCharset(const char *text, int32_t (*predicate)(char),
+                            const char *what, int32_t lineno)
 {
-    char *tok[5] = { NULL, NULL, NULL, NULL, NULL };
-    int   ntok = 0;
-    char *p;
-    size_t n;
+    const char *p;
+
+    for (p = text; *p != '\0'; p++) {
+        if (!predicate(*p)) {
+            IpcLogGlobalEmit(IPC_LOG_WARN, NULL,
+                             "config line %d: illegal char '%c' in %s", lineno, *p,
+                             what);
+            return IPC_ERR_CONFIG;
+        }
+    }
+    return IPC_OK;
+}
+
+int32_t IpcConfigParseLine(char *line, IpcConfigEntry *out, int32_t lineno)
+{
+    char  *token[4] = { NULL, NULL, NULL, NULL };
+    char  *p;
+    int32_t ntoken = 0;
+    size_t  n;
 
     if (line == NULL || out == NULL) {
         return IPC_ERR_INVAL;
     }
     memset(out, 0, sizeof(*out));
 
-    /* tokenise on runs of whitespace */
+    /* 按空白字符切分；这里是本函数唯一允许「就地写」的地方。 */
     p = line;
     while (*p != '\0') {
-        while (*p != '\0' && isspace((unsigned char)*p)) {
+        while (*p != '\0' && IsBlank(*p)) {
             p++;
         }
         if (*p == '\0') {
             break;
         }
-        if (ntok == 5) {
-            IPC_LOGE("config line %d: too many fields", lineno);
+        if (ntoken == 4) {
+            IpcLogGlobalEmit(IPC_LOG_WARN, NULL, "config line %d: too many fields",
+                             lineno);
             return IPC_ERR_CONFIG;
         }
-        tok[ntok++] = p;
-        while (*p != '\0' && !isspace((unsigned char)*p)) {
+        token[ntoken++] = p;
+        while (*p != '\0' && !IsBlank(*p)) {
             p++;
         }
         if (*p != '\0') {
@@ -75,252 +148,279 @@ int ipc_config_parse_line(char *line, ipc_config_entry_t *out, int lineno)
         }
     }
 
-    if (ntok == 0) {
-        return IPC_ERR_CONFIG; /* caller should have skipped blanks */
-    }
-    if (ntok != 4) {
-        IPC_LOGE("config line %d: expected 4 fields, got %d", lineno, ntok);
+    if (ntoken != 4) {
+        IpcLogGlobalEmit(IPC_LOG_WARN, NULL,
+                         "config line %d: expected 4 fields, got %d", lineno, ntoken);
         return IPC_ERR_CONFIG;
     }
 
-    /* namespace */
-    n = strlen(tok[0]);
-    if (n == 0 || n >= IPC_NS_MAX) {
-        IPC_LOGE("config line %d: namespace too long (max %d)", lineno,
-                 IPC_NS_MAX - 1);
+    /* 命名空间 */
+    n = strlen(token[0]);
+    if (n == 0 || n >= (size_t)IPC_NS_MAX) {
+        IpcLogGlobalEmit(IPC_LOG_WARN, NULL,
+                         "config line %d: namespace length %zu out of range (1..%d)",
+                         lineno, n, IPC_NS_MAX - 1);
         return IPC_ERR_CONFIG;
     }
-    ipc_strlcpy(out->ns, tok[0], sizeof(out->ns));
+    if (CheckCharset(token[0], IsNsChar, "namespace", lineno) != IPC_OK) {
+        return IPC_ERR_CONFIG;
+    }
+    (void)IpcStrlcpy(out->ns, token[0], sizeof(out->ns));
 
-    /* module */
-    n = strlen(tok[1]);
-    if (n == 0 || n >= IPC_NAME_MAX) {
-        IPC_LOGE("config line %d: module name too long (max %d)", lineno,
-                 IPC_NAME_MAX - 1);
+    /* 模块标识 */
+    n = strlen(token[1]);
+    if (n == 0 || n >= (size_t)IPC_NAME_MAX) {
+        IpcLogGlobalEmit(
+            IPC_LOG_WARN, NULL,
+            "config line %d: module id length %zu out of range (1..%d)", lineno, n,
+            IPC_NAME_MAX - 1);
         return IPC_ERR_CONFIG;
     }
-    ipc_strlcpy(out->module, tok[1], sizeof(out->module));
+    if (CheckCharset(token[1], IsModuleChar, "module id", lineno) != IPC_OK) {
+        return IPC_ERR_CONFIG;
+    }
+    (void)IpcStrlcpy(out->moduleId, token[1], sizeof(out->moduleId));
 
     /* uid */
-    if (parse_uid(tok[2], &out->uid) != IPC_OK) {
-        IPC_LOGE("config line %d: bad uid '%s'", lineno, tok[2]);
+    if (ParseUid(token[2], &out->uid) != IPC_OK) {
+        IpcLogGlobalEmit(IPC_LOG_WARN, NULL,
+                         "config line %d: uid must be a plain decimal number, got '%s'",
+                         lineno, token[2]);
         return IPC_ERR_CONFIG;
     }
 
-    /* socket path */
-    if (tok[3][0] != '/') {
-        IPC_LOGE("config line %d: socket path must be absolute", lineno);
+    /* 端点路径 */
+    if (token[3][0] != '/') {
+        IpcLogGlobalEmit(IPC_LOG_WARN, NULL,
+                         "config line %d: socket path must be absolute", lineno);
         return IPC_ERR_CONFIG;
     }
-    n = strlen(tok[3]);
-    if (n == 0 || n >= IPC_SUN_PATH_MAX) {
-        IPC_LOGE("config line %d: socket path too long (max %d)", lineno,
-                 IPC_SUN_PATH_MAX - 1);
+    n = strlen(token[3]);
+    if (n >= (size_t)IPC_PATH_MAX) {
+        IpcLogGlobalEmit(IPC_LOG_WARN, NULL,
+                         "config line %d: socket path length %zu exceeds %d", lineno, n,
+                         IPC_PATH_MAX - 1);
         return IPC_ERR_CONFIG;
     }
-    if (strcmp(tok[3], "/") == 0) {
-        IPC_LOGE("config line %d: '/' is not a socket path", lineno);
+    if (n == 1) {
+        IpcLogGlobalEmit(IPC_LOG_WARN, NULL,
+                         "config line %d: '/' is a directory, not a socket path",
+                         lineno);
         return IPC_ERR_CONFIG;
     }
-    ipc_strlcpy(out->path, tok[3], sizeof(out->path));
-
-    /* module ids must not contain characters that would be ambiguous in the
-     * journal / logs we produce in tests.  Keep them conservative. */
-    {
-        const char *q;
-        for (q = out->module; *q != '\0'; q++) {
-            if (!isalnum((unsigned char)*q) && *q != '_' && *q != '-' &&
-                *q != '.') {
-                IPC_LOGE("config line %d: illegal char '%c' in module name",
-                         lineno, *q);
-                return IPC_ERR_CONFIG;
-            }
-        }
-        for (q = out->ns; *q != '\0'; q++) {
-            if (!isalnum((unsigned char)*q) && *q != '_' && *q != '-') {
-                IPC_LOGE("config line %d: illegal char '%c' in namespace",
-                         lineno, *q);
-                return IPC_ERR_CONFIG;
-            }
-        }
-    }
+    (void)IpcStrlcpy(out->path, token[3], sizeof(out->path));
 
     return IPC_OK;
 }
 
 /* ------------------------------------------------------------------ */
-/* table                                                               */
+/* 表操作                                                             */
 /* ------------------------------------------------------------------ */
 
-static int push(ipc_config_t *c, const ipc_config_entry_t *e)
+static int32_t PushEntry(IpcConfig *config, const IpcConfigEntry *entry)
 {
-    if (c->count == c->cap) {
-        int                 ncap = c->cap ? c->cap * 2 : 16;
-        ipc_config_entry_t *ne =
-            realloc(c->entries, (size_t)ncap * sizeof(*ne));
-        if (ne == NULL) {
+    if (config->count == config->cap) {
+        int32_t         newCap = (config->cap > 0) ? (config->cap * 2) : 16;
+        IpcConfigEntry *grown;
+
+        grown = (IpcConfigEntry *)realloc(config->entries,
+                                         (size_t)newCap * sizeof(*grown));
+        if (grown == NULL) {
             return IPC_ERR_NOMEM;
         }
-        c->entries = ne;
-        c->cap     = ncap;
+        config->entries = grown;
+        config->cap     = newCap;
     }
-    c->entries[c->count++] = *e;
+    config->entries[config->count] = *entry;
+    config->count++;
     return IPC_OK;
 }
 
-static int find_dup(const ipc_config_t *c, const ipc_config_entry_t *e)
+/*
+ * 查重：`(ns, moduleId)` 与 path **各自**都必须唯一。
+ * 注意 path 的唯一性是跨命名空间的 —— 两个命名空间不能共用同一个 socket
+ * 路径，因为路径本身就是内核那个地址空间里的名字，跟本库的 ns 无关。
+ */
+static int32_t IsDuplicate(const IpcConfig *config, const IpcConfigEntry *entry)
 {
-    int i;
+    int32_t i;
 
-    for (i = 0; i < c->count; i++) {
-        if (strcmp(c->entries[i].ns, e->ns) == 0 &&
-            strcmp(c->entries[i].module, e->module) == 0) {
-            return 1; /* duplicate module inside a namespace */
+    for (i = 0; i < config->count; i++) {
+        const IpcConfigEntry *e = &config->entries[i];
+
+        if (strcmp(e->ns, entry->ns) == 0 && strcmp(e->moduleId, entry->moduleId) == 0) {
+            return 1;
         }
-        if (strcmp(c->entries[i].path, e->path) == 0) {
-            return 1; /* two modules sharing a socket path */
+        if (strcmp(e->path, entry->path) == 0) {
+            return 1;
         }
     }
     return 0;
 }
 
-int ipc_config_parse(const char *text, ipc_config_t **out)
+int32_t IpcConfigParse(const char *text, IpcConfig **outConfig)
 {
-    ipc_config_t *c;
-    char         *copy;
-    char         *line;
-    char         *save = NULL;
-    int           lineno = 0;
-    int           rc     = IPC_OK;
+    IpcConfig *config;
+    char      *copy;
+    char      *cursor;
+    int32_t    lineno = 0;
+    int32_t    rc     = IPC_OK;
 
-    if (text == NULL || out == NULL) {
+    if (text == NULL || outConfig == NULL) {
         return IPC_ERR_INVAL;
     }
-    *out = NULL;
+    *outConfig = NULL;
 
-    c = calloc(1, sizeof(*c));
-    if (c == NULL) {
+    config = (IpcConfig *)calloc(1, sizeof(*config));
+    if (config == NULL) {
         return IPC_ERR_NOMEM;
     }
-    copy = strdup(text);
+    copy = (char *)malloc(strlen(text) + 1);
     if (copy == NULL) {
-        free(c);
+        free(config);
         return IPC_ERR_NOMEM;
     }
+    (void)memcpy(copy, text, strlen(text) + 1);
 
-    for (line = strtok_r(copy, "\n", &save); line != NULL;
-         line = strtok_r(NULL, "\n", &save)) {
-        ipc_config_entry_t e;
+    cursor = copy;
+    while (*cursor != '\0') {
+        char              *lineEnd = strchr(cursor, '\n');
+        char              *hash;
         char              *p;
+        IpcConfigEntry     entry;
 
         lineno++;
-        p = strchr(line, '#');
-        if (p != NULL) {
-            *p = '\0';
+        if (lineEnd != NULL) {
+            *lineEnd = '\0';
         }
-        p = line;
-        while (*p != '\0' && isspace((unsigned char)*p)) {
-            p++;
-        }
-        if (*p == '\0') {
+        p = cursor;
+        if (IpcConfigStripEol(p) == 0) {
+            /* 空行（或只有 \r） */
+            if (lineEnd == NULL) {
+                break;
+            }
+            cursor = lineEnd + 1;
             continue;
         }
-        if (ipc_config_parse_line(p, &e, lineno) != IPC_OK) {
-            rc = IPC_ERR_CONFIG;
+
+        /* `#` 到行尾都是注释，行内注释同样支持。 */
+        hash = strchr(p, '#');
+        if (hash != NULL) {
+            *hash = '\0';
+        }
+        while (*p != '\0' && IsBlank(*p)) {
+            p++;
+        }
+        if (*p != '\0') {
+            rc = IpcConfigParseLine(p, &entry, lineno);
+            if (rc != IPC_OK) {
+                break;
+            }
+            if (IsDuplicate(config, &entry)) {
+                IpcLogGlobalEmit(IPC_LOG_WARN, NULL,
+                                 "config line %d: duplicate (ns,module) or duplicate "
+                                 "socket path",
+                                 lineno);
+                rc = IPC_ERR_CONFIG;
+                break;
+            }
+            rc = PushEntry(config, &entry);
+            if (rc != IPC_OK) {
+                break;
+            }
+        }
+
+        if (lineEnd == NULL) {
             break;
         }
-        if (find_dup(c, &e)) {
-            IPC_LOGE("config line %d: duplicate namespace/module or path", lineno);
-            rc = IPC_ERR_CONFIG;
-            break;
-        }
-        rc = push(c, &e);
-        if (rc != IPC_OK) {
-            break;
-        }
+        cursor = lineEnd + 1;
     }
 
     free(copy);
     if (rc != IPC_OK) {
-        ipc_config_free(c);
+        IpcConfigDestroy(config);
         return rc;
     }
-    *out = c;
+    *outConfig = config;
     return IPC_OK;
 }
 
-int ipc_config_load(const char *path, ipc_config_t **out)
+int32_t IpcConfigLoad(const char *path, IpcConfig **outConfig)
 {
-    char *text;
-    int   err = IPC_OK;
-    int   rc;
+    char   *text;
+    int32_t err = IPC_OK;
+    int32_t rc;
 
-    if (path == NULL || out == NULL) {
+    if (path == NULL || outConfig == NULL) {
         return IPC_ERR_INVAL;
     }
-    text = ipc_read_file(path, 1u << 20, &err);
+    text = IpcReadFile(path, IPC_CONFIG_FILE_MAX, &err);
     if (text == NULL) {
-        IPC_LOGE("cannot read config %s: %s", path, ipc_strerror(err));
+        IpcLogGlobalEmit(IPC_LOG_WARN, NULL, "cannot read config '%s': %s", path,
+                         IpcErrnoString(-err));
         return err;
     }
-    rc = ipc_config_parse(text, out);
-    free(text);
+    rc = IpcConfigParse(text, outConfig);
     if (rc != IPC_OK) {
-        IPC_LOGE("config %s rejected (%s)", path, ipc_strerror(rc));
+        IpcLogGlobalEmit(IPC_LOG_WARN, NULL, "config '%s' rejected (whole table)",
+                         path);
     }
+    free(text);
     return rc;
 }
 
-void ipc_config_free(ipc_config_t *cfg)
+void IpcConfigDestroy(IpcConfig *config)
 {
-    if (cfg == NULL) {
+    if (config == NULL) {
         return;
     }
-    free(cfg->entries);
-    free(cfg);
+    free(config->entries);
+    free(config);
 }
 
-int ipc_config_count(const ipc_config_t *cfg)
+int32_t IpcConfigGetCount(const IpcConfig *config)
 {
-    return cfg ? cfg->count : 0;
+    return (config != NULL) ? config->count : 0;
 }
 
-const ipc_config_entry_t *ipc_config_at(const ipc_config_t *cfg, int idx)
+const IpcConfigEntry *IpcConfigGetEntry(const IpcConfig *config, int32_t index)
 {
-    if (cfg == NULL || idx < 0 || idx >= cfg->count) {
+    if (config == NULL || index < 0 || index >= config->count) {
         return NULL;
     }
-    return &cfg->entries[idx];
+    return &config->entries[index];
 }
 
-const ipc_config_entry_t *ipc_config_lookup(const ipc_config_t *cfg,
-                                            const char *ns, const char *module)
+const IpcConfigEntry *IpcConfigFindModule(const IpcConfig *config, const char *ns,
+                                          const char *moduleId)
 {
-    int i;
+    int32_t i;
 
-    if (cfg == NULL || ns == NULL || module == NULL) {
+    if (config == NULL || ns == NULL || moduleId == NULL) {
         return NULL;
     }
-    for (i = 0; i < cfg->count; i++) {
-        if (strcmp(cfg->entries[i].ns, ns) == 0 &&
-            strcmp(cfg->entries[i].module, module) == 0) {
-            return &cfg->entries[i];
+    for (i = 0; i < config->count; i++) {
+        const IpcConfigEntry *e = &config->entries[i];
+
+        if (strcmp(e->ns, ns) == 0 && strcmp(e->moduleId, moduleId) == 0) {
+            return e;
         }
     }
     return NULL;
 }
 
-const ipc_config_entry_t *ipc_config_lookup_path(const ipc_config_t *cfg,
-                                                 const char *path)
+const IpcConfigEntry *IpcConfigFindByPath(const IpcConfig *config, const char *path)
 {
-    int i;
+    int32_t i;
 
-    if (cfg == NULL || path == NULL) {
+    if (config == NULL || path == NULL) {
         return NULL;
     }
-    for (i = 0; i < cfg->count; i++) {
-        if (strcmp(cfg->entries[i].path, path) == 0) {
-            return &cfg->entries[i];
+    for (i = 0; i < config->count; i++) {
+        const IpcConfigEntry *e = &config->entries[i];
+
+        if (strcmp(e->path, path) == 0) {
+            return e;
         }
     }
     return NULL;

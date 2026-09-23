@@ -1,12 +1,20 @@
+/*
+ * Copyright (c) 2026 <版权方待定>
+ * 许可协议：<待定>
+ *
+ * ipc_proto.c -- 线格式编解码与凭据解析的实现。
+ *
+ * 全部是纯函数：不碰 fd、不碰上下文，可以脱离 socket 直接做白盒单测。
+ */
 #include "ipc_proto.h"
 
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/* big-endian helpers (explicit; no struct overlay)                    */
+/* 大端读写（显式移位，不做 struct 覆写）                              */
 /* ------------------------------------------------------------------ */
 
-static void put_u32(uint8_t *p, uint32_t v)
+static void PutU32(uint8_t *p, uint32_t v)
 {
     p[0] = (uint8_t)(v >> 24);
     p[1] = (uint8_t)(v >> 16);
@@ -14,44 +22,55 @@ static void put_u32(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)v;
 }
 
-static uint32_t get_u32(const uint8_t *p)
+static uint32_t GetU32(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-static void put_u64(uint8_t *p, uint64_t v)
+static void PutU64(uint8_t *p, uint64_t v)
 {
-    put_u32(p, (uint32_t)(v >> 32));
-    put_u32(p + 4, (uint32_t)(v & 0xffffffffu));
+    PutU32(p, (uint32_t)(v >> 32));
+    PutU32(p + 4, (uint32_t)(v & 0xffffffffull));
 }
 
-static uint64_t get_u64(const uint8_t *p)
+static uint64_t GetU64(const uint8_t *p)
 {
-    return ((uint64_t)get_u32(p) << 32) | (uint64_t)get_u32(p + 4);
+    return ((uint64_t)GetU32(p) << 32) | (uint64_t)GetU32(p + 4);
 }
 
-/* Copy a fixed-width name field, guaranteeing NUL termination.  Returns 0 on
- * success, -1 if `src` does not fit into `cap` bytes including the NUL. */
-static int put_name(uint8_t *dst, size_t cap, const char *src)
+/* ------------------------------------------------------------------ */
+/* 定长名字字段                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 写入一个定长名字字段：先整段清零再拷贝，保证 NUL 填充。
+ * 源串为空、或含 NUL 后长度达到/超过字段宽度，都算失败。
+ */
+static int32_t PutName(uint8_t *dst, size_t cap, const char *src)
 {
     size_t n;
 
     if (src == NULL) {
-        return -1;
+        return IPC_ERR_PROTO;
     }
     n = strlen(src);
     if (n == 0 || n >= cap) {
-        return -1;
+        return IPC_ERR_PROTO;
     }
     memset(dst, 0, cap);
     memcpy(dst, src, n);
-    return 0;
+    return IPC_OK;
 }
 
-/* Read a fixed-width name field and require that it is NUL terminated
- * somewhere inside the field and not empty. */
-static int get_name(const uint8_t *src, size_t cap, char *out)
+/*
+ * 读出一个定长名字字段，要求字段内**存在** NUL 且内容非空。
+ *
+ * 为什么必须要求 NUL 在字段内：如果 32 字节被 32 个有效字符填满，说明发送方
+ * 写的时候就没有终止符（或者被裁剪过），此时把整段当字符串用会越过字段边界
+ * 读到后面 event / payloadLen 的字节上去。宁可报协议错。
+ */
+static int32_t GetName(const uint8_t *src, size_t cap, char *out)
 {
     size_t i;
 
@@ -61,79 +80,89 @@ static int get_name(const uint8_t *src, size_t cap, char *out)
         }
     }
     if (i == 0 || i == cap) {
-        return -1; /* empty, or no terminator inside the field */
+        return IPC_ERR_PROTO; /* 空字段，或字段内没有终止符 */
     }
     memcpy(out, src, i);
     out[i] = '\0';
-    return 0;
+    return IPC_OK;
+}
+
+static int32_t TypeIsValid(uint8_t type)
+{
+    return (type == (uint8_t)IPC_MSG_TYPE_POST || type == (uint8_t)IPC_MSG_TYPE_REQ ||
+            type == (uint8_t)IPC_MSG_TYPE_REP)
+               ? 1
+               : 0;
 }
 
 /* ------------------------------------------------------------------ */
-/* header                                                              */
+/* 报头                                                               */
 /* ------------------------------------------------------------------ */
 
-size_t ipc_hdr_encode(const ipc_hdr_t *h, uint8_t *buf, size_t cap)
+size_t IpcProtoEncode(const IpcProtoHeader *header, uint8_t *buf, size_t cap)
 {
-    if (h == NULL || buf == NULL || cap < IPC_HDR_SIZE) {
+    if (header == NULL || buf == NULL || cap < IPC_HDR_SIZE) {
         return 0;
     }
-    if (h->type != IPC_TYPE_POST && h->type != IPC_TYPE_REQ &&
-        h->type != IPC_TYPE_REP) {
+    if (header->version != (uint8_t)IPC_PROTOCOL_VERSION) {
         return 0;
     }
-    if (h->version != IPC_PROTO_VERSION) {
+    if (!TypeIsValid(header->type)) {
         return 0;
     }
-    if (h->payload_len > IPC_PAYLOAD_HARD_MAX) {
+    if (header->flags != 0) {
+        return 0; /* v1 保留位必须为 0，非 0 一律拒绝，不偷偷忽略 */
+    }
+    if (header->payloadLen > IPC_PAYLOAD_HARD_MAX) {
         return 0;
     }
-    if (put_name(buf + 8, IPC_NS_MAX, h->ns) != 0) {
+    if (PutName(buf + 8, IPC_NS_MAX, header->ns) != IPC_OK) {
         return 0;
     }
-    if (put_name(buf + 24, IPC_NAME_MAX, h->src) != 0) {
+    if (PutName(buf + 24, IPC_NAME_MAX, header->src) != IPC_OK) {
         return 0;
     }
-    if (put_name(buf + 56, IPC_NAME_MAX, h->dst) != 0) {
+    if (PutName(buf + 56, IPC_NAME_MAX, header->dst) != IPC_OK) {
         return 0;
     }
 
-    buf[0] = 'U';
-    buf[1] = 'I';
-    buf[2] = 'P';
-    buf[3] = 'C';
-    buf[4] = h->version;
-    buf[5] = h->type;
-    buf[6] = h->flags;
+    buf[0] = (uint8_t)'U';
+    buf[1] = (uint8_t)'I';
+    buf[2] = (uint8_t)'P';
+    buf[3] = (uint8_t)'C';
+    buf[4] = header->version;
+    buf[5] = header->type;
+    buf[6] = header->flags;
     buf[7] = (uint8_t)IPC_HDR_SIZE;
 
-    put_u32(buf + 88, h->event);
-    put_u32(buf + 92, h->payload_len);
-    put_u64(buf + 96, h->req_id);
-    put_u64(buf + 104, h->instance_id);
+    PutU32(buf + 88, header->event);
+    PutU32(buf + 92, header->payloadLen);
+    PutU64(buf + 96, header->reqId);
+    PutU64(buf + 104, header->instanceId);
 
-    return IPC_HDR_SIZE;
+    return (size_t)IPC_HDR_SIZE;
 }
 
-int ipc_hdr_decode(const uint8_t *buf, size_t len, ipc_hdr_t *out)
+int32_t IpcProtoDecode(const uint8_t *buf, size_t len, IpcProtoHeader *out)
 {
     if (buf == NULL || out == NULL) {
         return IPC_ERR_INVAL;
     }
-    if (len < IPC_HDR_SIZE) {
-        return IPC_ERR_PROTO; /* short header */
+    if (len < (size_t)IPC_HDR_SIZE) {
+        return IPC_ERR_PROTO; /* 短头 */
     }
-    if (buf[0] != 'U' || buf[1] != 'I' || buf[2] != 'P' || buf[3] != 'C') {
+    if (buf[0] != (uint8_t)'U' || buf[1] != (uint8_t)'I' || buf[2] != (uint8_t)'P' ||
+        buf[3] != (uint8_t)'C') {
         return IPC_ERR_PROTO;
     }
-    if (buf[4] != IPC_PROTO_VERSION) {
-        return IPC_ERR_PROTO;
+    if (buf[4] != (uint8_t)IPC_PROTOCOL_VERSION) {
+        return IPC_ERR_PROTO; /* 版本不符：不尝试向后兼容解析 */
     }
-    if (buf[5] != IPC_TYPE_POST && buf[5] != IPC_TYPE_REQ &&
-        buf[5] != IPC_TYPE_REP) {
+    if (!TypeIsValid(buf[5])) {
         return IPC_ERR_PROTO;
     }
     if (buf[6] != 0) {
-        return IPC_ERR_PROTO; /* reserved flags must be zero in v1 */
+        return IPC_ERR_PROTO;
     }
     if (buf[7] != (uint8_t)IPC_HDR_SIZE) {
         return IPC_ERR_PROTO;
@@ -144,66 +173,72 @@ int ipc_hdr_decode(const uint8_t *buf, size_t len, ipc_hdr_t *out)
     out->type    = buf[5];
     out->flags   = buf[6];
 
-    if (get_name(buf + 8, IPC_NS_MAX, out->ns) != 0) {
+    if (GetName(buf + 8, IPC_NS_MAX, out->ns) != IPC_OK) {
         return IPC_ERR_PROTO;
     }
-    if (get_name(buf + 24, IPC_NAME_MAX, out->src) != 0) {
+    if (GetName(buf + 24, IPC_NAME_MAX, out->src) != IPC_OK) {
         return IPC_ERR_PROTO;
     }
-    if (get_name(buf + 56, IPC_NAME_MAX, out->dst) != 0) {
+    if (GetName(buf + 56, IPC_NAME_MAX, out->dst) != IPC_OK) {
         return IPC_ERR_PROTO;
     }
 
-    out->event       = get_u32(buf + 88);
-    out->payload_len = get_u32(buf + 92);
-    out->req_id      = get_u64(buf + 96);
-    out->instance_id = get_u64(buf + 104);
+    out->event       = GetU32(buf + 88);
+    out->payloadLen  = GetU32(buf + 92);
+    out->reqId       = GetU64(buf + 96);
+    out->instanceId  = GetU64(buf + 104);
 
-    if (out->payload_len > IPC_PAYLOAD_HARD_MAX) {
-        return IPC_ERR_PROTO; /* declared length out of range: reject early */
+    if (out->payloadLen > IPC_PAYLOAD_HARD_MAX) {
+        return IPC_ERR_PROTO; /* 声明的长度越界：早拒，不去分配 */
     }
     return IPC_OK;
 }
 
 /* ------------------------------------------------------------------ */
-/* credentials                                                         */
+/* 凭据                                                               */
 /* ------------------------------------------------------------------ */
 
-int ipc_cred_from_msg(struct msghdr *mh, int msg_flags, ipc_cred_t *out)
+int32_t IpcProtoCredFromMsg(struct msghdr *msg, int32_t msgFlags, IpcCred *out)
 {
     struct cmsghdr *cmsg;
-    int found = 0;
+    int32_t         found = 0;
 
     if (out == NULL) {
         return IPC_ERR_INVAL;
     }
     memset(out, 0, sizeof(*out));
 
-    if (mh == NULL) {
+    if (msg == NULL) {
         return IPC_ERR_INVAL;
     }
-    if (msg_flags & MSG_CTRUNC) {
-        /* The control buffer was too small: the credentials may have been the
-         * part that got truncated, so we cannot trust anything here. */
+    if ((msgFlags & MSG_CTRUNC) != 0) {
+        /*
+         * 控制缓冲被截断：凭据有可能正是被切掉的那部分，因此这里看到的一切
+         * 都不可信。不能「没看到凭据就当没有凭据」地放行。
+         */
         return IPC_ERR_CRED;
     }
-    if (mh->msg_control == NULL || mh->msg_controllen == 0) {
-        return IPC_ERR_CRED;
+    if (msg->msg_control == NULL || msg->msg_controllen == 0) {
+        return IPC_ERR_CRED; /* 开了 SO_PASSCRED 就不该出现这种情况 */
     }
 
-    for (cmsg = CMSG_FIRSTHDR(mh); cmsg != NULL; cmsg = CMSG_NXTHDR(mh, cmsg)) {
+    for (cmsg = CMSG_FIRSTHDR(msg); cmsg != NULL; cmsg = CMSG_NXTHDR(msg, cmsg)) {
         if (cmsg->cmsg_len < sizeof(struct cmsghdr)) {
-            return IPC_ERR_PROTO; /* inconsistent cmsg_len: stop parsing */
+            return IPC_ERR_PROTO; /* cmsg_len 自相矛盾：停手，不再往下解析 */
         }
-        if (cmsg->cmsg_level != SOL_SOCKET ||
-            cmsg->cmsg_type != SCM_CREDENTIALS) {
-            continue;
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_CREDENTIALS) {
+            continue; /* 不认识的辅助数据，忽略 */
         }
         if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct ucred))) {
-            return IPC_ERR_CRED; /* truncated credentials */
+            return IPC_ERR_CRED; /* 凭据本身被截断 */
+        }
+        if (found) {
+            /* 内核只会填一条。出现第二条说明这个报文不是内核原样送来的。 */
+            return IPC_ERR_CRED;
         }
         {
             struct ucred uc;
+
             memcpy(&uc, CMSG_DATA(cmsg), sizeof(uc));
             out->pid     = uc.pid;
             out->uid     = uc.uid;
@@ -214,26 +249,7 @@ int ipc_cred_from_msg(struct msghdr *mh, int msg_flags, ipc_cred_t *out)
     }
 
     if (!found) {
-        return IPC_ERR_CRED; /* SO_PASSCRED is on: this must never happen */
+        return IPC_ERR_CRED;
     }
     return IPC_OK;
-}
-
-void ipc_payload_to_cstr(const void *data, size_t len, char *out, size_t cap)
-{
-    size_t i, n;
-
-    if (out == NULL || cap == 0) {
-        return;
-    }
-    if (data == NULL || len == 0) {
-        out[0] = '\0';
-        return;
-    }
-    n = len < (cap - 1) ? len : (cap - 1);
-    for (i = 0; i < n; i++) {
-        unsigned char c = ((const unsigned char *)data)[i];
-        out[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
-    }
-    out[n] = '\0';
 }

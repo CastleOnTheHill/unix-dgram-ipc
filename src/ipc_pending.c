@@ -1,235 +1,336 @@
+/*
+ * Copyright (c) 2026 <版权方待定>
+ * 许可协议：<待定>
+ *
+ * ipc_pending.c -- 同步请求等待表的实现。
+ *
+ * 只依赖 pthread 互斥/条件变量，不感知 socket，因此可以脱离内核完整单测。
+ */
 #include "ipc_pending.h"
 
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "ipc_util.h"
 
-int ipc_pending_init(ipc_pending_t *p, int cap)
+/* ------------------------------------------------------------------ */
+/* 内部小工具                                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 取单调时钟的绝对时间点，供 pthread_cond_timedwait 使用。
+ * 条件变量初始化时已经绑到 CLOCK_MONOTONIC，两边必须一致 —— 混用
+ * CLOCK_REALTIME 的等待会立刻返回 ETIMEDOUT，是个很难看的 bug。
+ */
+static int32_t MonoDeadlineAfter(int32_t timeoutMs, uint64_t *outNs)
 {
-    if (p == NULL || cap <= 0) {
+    uint64_t now = IpcMonoNs();
+    uint64_t delta;
+
+    if (timeoutMs < 0) {
+        *outNs = 0; /* 无限等待 */
+        return IPC_OK;
+    }
+    delta = (uint64_t)timeoutMs * 1000000ull;
+    *outNs = now + delta;
+    if (*outNs <= now) {
+        *outNs = now + 1; /* 保证单调前进，0 有特殊含义不能用 */
+    }
+    return IPC_OK;
+}
+
+static void MonoNsToTimespec(uint64_t ns, struct timespec *ts)
+{
+    ts->tv_sec  = (time_t)(ns / 1000000000ull);
+    ts->tv_nsec = (long)(ns % 1000000000ull);
+}
+
+/* ------------------------------------------------------------------ */
+/* 生命周期                                                           */
+/* ------------------------------------------------------------------ */
+
+int32_t IpcPendingInit(IpcPending *pending, int32_t capacity,
+                       _Atomic int32_t *abortFlag)
+{
+    pthread_condattr_t attr;
+    int32_t            rc;
+
+    if (pending == NULL) {
         return IPC_ERR_INVAL;
     }
-    memset(p, 0, sizeof(*p));
-    p->slots = calloc((size_t)cap, sizeof(*p->slots));
-    if (p->slots == NULL) {
+    memset(pending, 0, sizeof(*pending));
+
+    if (capacity <= 0) {
+        capacity = IPC_PENDING_DEFAULT_CAPACITY;
+    }
+    pending->slots =
+        (IpcPendingSlot *)calloc((size_t)capacity, sizeof(*pending->slots));
+    if (pending->slots == NULL) {
         return IPC_ERR_NOMEM;
     }
-    p->cap = cap;
-    if (pthread_mutex_init(&p->lock, NULL) != 0 ||
-        pthread_cond_init(&p->cv, NULL) != 0) {
-        free(p->slots);
-        p->slots = NULL;
+    pending->capacity   = capacity;
+    pending->nextReqId  = 1;
+    pending->abortFlag  = abortFlag;
+
+    rc = pthread_mutex_init(&pending->lock, NULL);
+    if (rc != 0) {
+        free(pending->slots);
+        pending->slots = NULL;
+        return IPC_ERR_IO;
+    }
+    rc = pthread_condattr_init(&attr);
+    if (rc != 0) {
+        (void)pthread_mutex_destroy(&pending->lock);
+        free(pending->slots);
+        pending->slots = NULL;
+        return IPC_ERR_IO;
+    }
+    /*
+     * 把条件变量绑到单调时钟。用墙钟的话，一次 NTP 校时或手工改时间就能让
+     * 「等 100 ms」变成「立刻超时」或「等一年」。
+     */
+    rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (rc == 0) {
+        rc = pthread_cond_init(&pending->cv, &attr);
+    }
+    (void)pthread_condattr_destroy(&attr);
+    if (rc != 0) {
+        (void)pthread_mutex_destroy(&pending->lock);
+        free(pending->slots);
+        pending->slots = NULL;
         return IPC_ERR_IO;
     }
     return IPC_OK;
 }
 
-void ipc_pending_destroy(ipc_pending_t *p)
+void IpcPendingDestroy(IpcPending *pending)
 {
-    if (p == NULL) {
+    if (pending == NULL) {
         return;
     }
-    pthread_cond_destroy(&p->cv);
-    pthread_mutex_destroy(&p->lock);
-    free(p->slots);
-    p->slots = NULL;
+    if (pending->slots != NULL) {
+        free(pending->slots);
+        pending->slots = NULL;
+    }
+    (void)pthread_cond_destroy(&pending->cv);
+    (void)pthread_mutex_destroy(&pending->lock);
 }
 
-int ipc_pending_add(ipc_pending_t *p, const char *dst, int64_t timeout_ms,
-                    void *reply_buf, size_t reply_cap,
-                    int *out_idx, uint64_t *out_id)
-{
-    int    i;
-    int    rc = IPC_OK;
+/* ------------------------------------------------------------------ */
+/* 登记 / 等待 / 释放                                                 */
+/* ------------------------------------------------------------------ */
 
-    if (p == NULL || dst == NULL || out_idx == NULL || out_id == NULL) {
+int32_t IpcPendingAdd(IpcPending *pending, const char *dstModuleId,
+                      uint64_t expectedInstanceId, int32_t timeoutMs, void *replyBuf,
+                      size_t replyCap, int32_t *outIndex, uint64_t *outReqId)
+{
+    int32_t  index = -1;
+    int32_t  i;
+    int32_t  rc;
+    uint64_t deadline = 0;
+
+    if (pending == NULL || dstModuleId == NULL || outIndex == NULL || outReqId == NULL) {
         return IPC_ERR_INVAL;
     }
-    pthread_mutex_lock(&p->lock);
-    if (p->shutting_down) {
-        rc = IPC_ERR_STOPPED;
-        goto out;
+    if (replyBuf == NULL && replyCap != 0) {
+        return IPC_ERR_INVAL;
     }
-    for (i = 0; i < p->cap; i++) {
-        if (!p->slots[i].in_use) {
+
+    (void)pthread_mutex_lock(&pending->lock);
+    for (i = 0; i < pending->capacity; i++) {
+        if (!pending->slots[i].inUse) {
+            index = i;
             break;
         }
     }
-    if (i == p->cap) {
-        rc = IPC_ERR_TOOMANY;
-        goto out;
+    if (index < 0) {
+        (void)pthread_mutex_unlock(&pending->lock);
+        return IPC_ERR_TOOMANY;
     }
+
+    rc = MonoDeadlineAfter(timeoutMs, &deadline);
+    if (rc != IPC_OK) {
+        (void)pthread_mutex_unlock(&pending->lock);
+        return rc;
+    }
+
     {
-        ipc_pending_slot_t *s = &p->slots[i];
-        memset(s, 0, sizeof(*s));
-        s->in_use      = 1;
-        s->reply_buf   = reply_buf;
-        s->reply_cap   = reply_cap;
-        s->req_id      = ++p->next_req_id;
-        s->owner_pid   = getpid();
-        s->deadline_ns = 0;
-        ipc_strlcpy(s->dst, dst, sizeof(s->dst));
-        if (timeout_ms >= 0) {
-            s->deadline_ns = ipc_mono_ns() + (uint64_t)timeout_ms * 1000000ull;
-        }
-        *out_idx = i;
-        *out_id  = s->req_id;
-        p->used++;
+        IpcPendingSlot *slot = &pending->slots[index];
+
+        memset(slot, 0, sizeof(*slot));
+        slot->inUse       = 1;
+        slot->reqId       = pending->nextReqId;
+        slot->expectedInstanceId = expectedInstanceId;
+        slot->replyBuf    = replyBuf;
+        slot->replyCap    = (replyBuf != NULL) ? replyCap : 0;
+        slot->replyLen    = 0;
+        slot->fullLen     = 0;
+        slot->done        = 0;
+        slot->result      = IPC_OK;
+        slot->deadlineNs  = deadline;
+        (void)IpcStrlcpy(slot->dstModuleId, dstModuleId, sizeof(slot->dstModuleId));
+
+        pending->nextReqId++;
+        pending->liveSlots++;
+        *outReqId = slot->reqId;
     }
-out:
-    pthread_mutex_unlock(&p->lock);
-    return rc;
+    (void)pthread_mutex_unlock(&pending->lock);
+
+    *outIndex = index;
+    return IPC_OK;
 }
 
-void ipc_pending_release(ipc_pending_t *p, int idx)
+int32_t IpcPendingWait(IpcPending *pending, int32_t index, size_t *outLen,
+                       size_t *outFullLen)
 {
-    if (p == NULL || idx < 0 || idx >= p->cap) {
-        return;
-    }
-    pthread_mutex_lock(&p->lock);
-    if (p->slots[idx].in_use) {
-        p->slots[idx].in_use = 0;
-        p->used--;
-    }
-    pthread_mutex_unlock(&p->lock);
-}
+    IpcPendingSlot *slot;
+    int32_t         result;
 
-int ipc_pending_complete(ipc_pending_t *p, uint64_t req_id, const char *src,
-                         const void *data, size_t len)
-{
-    int i;
-    int rc = IPC_ERR_NOENT;
-
-    if (p == NULL || src == NULL) {
+    if (pending == NULL || index < 0 || index >= pending->capacity) {
         return IPC_ERR_INVAL;
     }
-    pthread_mutex_lock(&p->lock);
-    for (i = 0; i < p->cap; i++) {
-        ipc_pending_slot_t *s = &p->slots[i];
-        if (!s->in_use || s->done) {
-            continue;
-        }
-        if (s->req_id != req_id) {
-            continue;
-        }
-        if (strcmp(s->dst, src) != 0) {
-            continue; /* reply from the wrong module: not ours */
-        }
-        if (s->reply_buf != NULL && s->reply_cap > 0) {
-            if (len > s->reply_cap) {
-                s->rc        = IPC_ERR_MSGSIZE;
-                s->reply_len = len; /* tell the caller how much is needed */
-            } else {
-                if (len > 0 && data != NULL) {
-                    memcpy(s->reply_buf, data, len);
-                }
-                s->rc        = IPC_OK;
-                s->reply_len = len;
-            }
-        } else {
-            s->rc        = IPC_OK;
-            s->reply_len = len;
-        }
-        s->done = 1;
-        rc      = IPC_OK;
-        break;
-    }
-    if (rc == IPC_OK) {
-        pthread_cond_broadcast(&p->cv);
-    }
-    pthread_mutex_unlock(&p->lock);
-    return rc;
-}
+    slot = &pending->slots[index];
 
-int ipc_pending_wait(ipc_pending_t *p, int idx, size_t *reply_len_out)
-{
-    int rc = IPC_OK;
-
-    if (p == NULL || idx < 0 || idx >= p->cap) {
-        return IPC_ERR_INVAL;
-    }
-    pthread_mutex_lock(&p->lock);
+    (void)pthread_mutex_lock(&pending->lock);
     for (;;) {
-        ipc_pending_slot_t *s = &p->slots[idx];
+        if (slot->done != 0) {
+            result = slot->result;
+            break;
+        }
+        if (pending->abortFlag != NULL &&
+            atomic_load_explicit(pending->abortFlag, memory_order_relaxed) != 0) {
+            result = IPC_ERR_STOPPED;
+            break;
+        }
+        if (slot->deadlineNs == 0) {
+            (void)pthread_cond_wait(&pending->cv, &pending->lock);
+            continue;
+        }
+        {
+            uint64_t        now = IpcMonoNs();
+            struct timespec ts;
 
-        if (p->shutting_down) {
-            rc = IPC_ERR_STOPPED;
-            break;
-        }
-        if (s->done) {
-            rc = s->rc;
-            break;
-        }
-        if (s->deadline_ns != 0) {
-            uint64_t now = ipc_mono_ns();
-            if (now >= s->deadline_ns) {
-                s->done     = 1;
-                s->rc       = IPC_ERR_TIMEOUT;
-                s->reply_len = 0;
-                rc          = IPC_ERR_TIMEOUT;
+            if (slot->deadlineNs != 0 && now >= slot->deadlineNs) {
+                result = IPC_ERR_TIMEOUT;
                 break;
             }
-            {
-                struct timespec ts;
-                uint64_t        left = s->deadline_ns - now;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += (time_t)(left / 1000000000ull);
-                ts.tv_nsec += (long)(left % 1000000000ull);
-                if (ts.tv_nsec >= 1000000000L) {
-                    ts.tv_sec += 1;
-                    ts.tv_nsec -= 1000000000L;
-                }
-                pthread_cond_timedwait(&p->cv, &p->lock, &ts);
-            }
-        } else {
-            pthread_cond_wait(&p->cv, &p->lock);
+            MonoNsToTimespec(slot->deadlineNs, &ts);
+            /* ETIMEDOUT 不在这里判定，交给下一轮循环统一处理，
+             * 这样「超时的同时回复刚好到达」的竞态只有一处裁决点。 */
+            (void)pthread_cond_timedwait(&pending->cv, &pending->lock, &ts);
         }
     }
-    if (reply_len_out != NULL) {
-        *reply_len_out = p->slots[idx].reply_len;
+
+    if (result != IPC_OK) {
+        /*
+         * 把槽位钉成「已结束」。否则在调用者拿到超时之后、IpcPendingRelease
+         * 之前的这个窗口里，一条迟到的回复仍然会认领这个槽位，被统计成
+         * replyMatched —— 而调用者明明已经收到 TIMEOUT 了。
+         */
+        slot->done   = 1;
+        slot->result = result;
     }
-    pthread_mutex_unlock(&p->lock);
-    return rc;
+    (void)pthread_mutex_unlock(&pending->lock);
+
+    if (outLen != NULL) {
+        *outLen = slot->replyLen;
+    }
+    if (outFullLen != NULL) {
+        *outFullLen = slot->fullLen;
+    }
+    return result;
 }
 
-void ipc_pending_shutdown(ipc_pending_t *p)
+void IpcPendingRelease(IpcPending *pending, int32_t index)
 {
-    int i;
-
-    if (p == NULL) {
+    if (pending == NULL || index < 0 || index >= pending->capacity) {
         return;
     }
-    pthread_mutex_lock(&p->lock);
-    p->shutting_down = 1;
-    for (i = 0; i < p->cap; i++) {
-        if (p->slots[i].in_use && !p->slots[i].done) {
-            p->slots[i].done      = 1;
-            p->slots[i].rc        = IPC_ERR_STOPPED;
-            p->slots[i].reply_len = 0;
+    (void)pthread_mutex_lock(&pending->lock);
+    if (pending->slots[index].inUse != 0) {
+        memset(&pending->slots[index], 0, sizeof(pending->slots[index]));
+        pending->liveSlots--;
+        if (pending->liveSlots < 0) {
+            pending->liveSlots = 0; /* 理论不可达，防呆 */
         }
+        (void)pthread_cond_broadcast(&pending->cv); /* 让排空等待者有机会醒来 */
     }
-    pthread_cond_broadcast(&p->cv);
-    pthread_mutex_unlock(&p->lock);
+    (void)pthread_mutex_unlock(&pending->lock);
 }
 
-int ipc_pending_used(ipc_pending_t *p)
+void IpcPendingWaitDrained(IpcPending *pending)
 {
-    int n;
-
-    if (p == NULL) {
-        return 0;
+    if (pending == NULL) {
+        return;
     }
-    pthread_mutex_lock(&p->lock);
-    n = p->used;
-    pthread_mutex_unlock(&p->lock);
-    return n;
+    (void)pthread_mutex_lock(&pending->lock);
+    while (pending->liveSlots > 0) {
+        (void)pthread_cond_wait(&pending->cv, &pending->lock);
+    }
+    (void)pthread_mutex_unlock(&pending->lock);
 }
 
-int ipc_pending_cap(const ipc_pending_t *p)
+/* ------------------------------------------------------------------ */
+/* 回复认领                                                           */
+/* ------------------------------------------------------------------ */
+
+void IpcPendingComplete(IpcPending *pending, const char *srcModuleId,
+                        uint64_t instanceId, uint64_t reqId, const void *payload,
+                        size_t len, int32_t *outMatched)
 {
-    return p ? p->cap : 0;
+    int32_t i;
+
+    if (outMatched != NULL) {
+        *outMatched = 0;
+    }
+    if (pending == NULL || srcModuleId == NULL) {
+        return;
+    }
+
+    (void)pthread_mutex_lock(&pending->lock);
+    for (i = 0; i < pending->capacity; i++) {
+        IpcPendingSlot *slot = &pending->slots[i];
+        size_t          copyLen;
+
+        if (slot->inUse == 0 || slot->done != 0) {
+            continue;
+        }
+        if (slot->reqId != reqId) {
+            continue;
+        }
+        if (strcmp(slot->dstModuleId, srcModuleId) != 0) {
+            continue; /* 别的模块冒充回复 */
+        }
+        if (slot->expectedInstanceId != instanceId) {
+            continue; /* 上一代实例残留的陈旧回复 */
+        }
+
+        slot->fullLen = len;
+        copyLen       = 0;
+        if (slot->replyBuf != NULL && slot->replyCap > 0 && len > 0 && payload != NULL) {
+            copyLen = (len < slot->replyCap) ? len : slot->replyCap; /* 截断 */
+            memcpy(slot->replyBuf, payload, copyLen);
+        }
+        slot->replyLen = copyLen;
+        slot->result   = IPC_OK;
+        slot->done     = 1;
+        (void)pthread_cond_broadcast(&pending->cv);
+        if (outMatched != NULL) {
+            *outMatched = 1;
+        }
+        break;
+    }
+    (void)pthread_mutex_unlock(&pending->lock);
+}
+
+void IpcPendingWakeAll(IpcPending *pending)
+{
+    if (pending == NULL) {
+        return;
+    }
+    (void)pthread_mutex_lock(&pending->lock);
+    (void)pthread_cond_broadcast(&pending->cv);
+    (void)pthread_mutex_unlock(&pending->lock);
 }

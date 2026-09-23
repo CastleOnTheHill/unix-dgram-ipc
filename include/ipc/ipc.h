@@ -87,6 +87,28 @@
  *   全局变量                       g_ 前缀          （本头文件不引入全局变量）
  *   文件名                        小写 + 下划线     ipc.h / ipc_ctx.c
  *
+ * 类型选择遵循《OpenHarmony 32/64 位可移植规范》：整型一律用 <stdint.h> 的
+ * 定长类型，不用 int / long / short —— 它们在 ILP32 与 LP64 下宽度不一致，
+ * 一旦落到对外接口或线格式上就是兼容性隐患。
+ *
+ *   计数、标志、返回码、下标      → int32_t（规范原文：int32_t 代替 int）
+ *   事件号、载荷长度、实例号低位  → uint32_t
+ *   统计计数、请求序号、代际号    → uint64_t
+ *
+ * 规范允许的三类例外（它自己写了「因平台/第三方/库函数原因可有限使用，
+ * 但需要增加说明」），本文件保留原类型，说明如下：
+ *   size_t —— 长度与容量。POSIX 接口本身就是 size_t（recvmsg / memcpy /
+ *             snprintf 都是），改成 int32_t 只会逼着每个边界上都强转。
+ *             注意规范另有一条规则：**禁止 size_t 与 int32_t 互相赋值**，
+ *             所以本文件里的 size_t 参数绝不与 int32_t 参数传同一个值。
+ *   uid_t / pid_t —— POSIX 类型，规范表里标注为「Linux 内置，固定长度」。
+ *             换成 int32_t 丢掉语义，也挡不住将来改宽。
+ *   char —— 字符串与路径，规范要求用原生 char。
+ *
+ * 实现提醒：这些类型打印时格式串必须对上，否则在 LP64 上会截断或告警。
+ *   int32_t/uint32_t → %d / %u        size_t → %zu
+ *   int64_t/uint64_t → %PRId64 / %PRIu64（来自 <inttypes.h>，别写 %lld）
+ *
  * 两条已知的、有意为之的偏离，先说清楚免得评审时当成疏漏：
  *   1. 规范 §3 要求「使用英文进行注释」，本文件按项目要求改用中文注释。
  *      两种风格不要混用；若将来要回归规范，整文件一起改。
@@ -166,8 +188,11 @@ extern "C" {
 
 /*
  * 全部错误码为负值，IPC_OK 为 0。
- * 函数返回类型写 int 而不是本枚举，是为了让老系统的适配层可以直接用 int
- * 承接返回值、按 <0 / ==0 判断，不必引入新类型。
+ *
+ * 枚举只用来给这些常量命名。**对外接口的类型是 int32_t，不是本枚举** ——
+ * 枚举的底层宽度由实现自定，不适合出现在对外边界上；而且这样老系统的适配层
+ * 可以直接用 int32_t 承接返回值、按 <0 / ==0 判断，不必引入新类型。
+ * 全部取值都落在 int32_t 范围内（-17..0），转换无损。
  */
 typedef enum {
     IPC_OK                  = 0,     /* 成功 */
@@ -194,7 +219,7 @@ typedef enum {
  * 返回码转可读字符串。纯诊断用，日志和测试打印用；
  * 传入未知值时返回 "unknown"，不返回 NULL。
  */
-const char *IpcResultToString(int result);
+const char *IpcResultToString(int32_t result);
 
 /* ================================================================== */
 /* 3. 报文类型                                                        */
@@ -239,22 +264,22 @@ typedef struct IpcConfig IpcConfig;
  * 说明：这是**库自带的**配置解析。若老系统已有等价的模块名单加载逻辑，
  * 适配层可以直接改用老逻辑，本组接口不必强绑。
  */
-int IpcConfigLoad(const char *path, IpcConfig **outConfig);
+int32_t IpcConfigLoad(const char *path, IpcConfig **outConfig);
 
 /*
  * 从内存字符串解析，语义与 IpcConfigLoad 完全一致。
  * 存在的主要理由是单元测试和工具，不想依赖磁盘上的文件。
  */
-int IpcConfigParse(const char *text, IpcConfig **outConfig);
+int32_t IpcConfigParse(const char *text, IpcConfig **outConfig);
 
 /* 释放配置对象。传 NULL 安全返回。 */
 void IpcConfigDestroy(IpcConfig *config);
 
 /* 表内条目数；config 为 NULL 时返回 0。 */
-int IpcConfigGetCount(const IpcConfig *config);
+int32_t IpcConfigGetCount(const IpcConfig *config);
 
 /* 按下标取条目，越界返回 NULL。 */
-const IpcConfigEntry *IpcConfigGetEntry(const IpcConfig *config, int index);
+const IpcConfigEntry *IpcConfigGetEntry(const IpcConfig *config, int32_t index);
 
 /* 按 (ns, moduleId) 正查，找不到返回 NULL。 */
 const IpcConfigEntry *IpcConfigFindModule(const IpcConfig *config,
@@ -323,8 +348,8 @@ typedef struct {
  *   —— 其中 IpcSend 只有在线程池里执行时才安全；若宿主把 dispatch 写成
  *      「在本线程内联调回调」，则 IpcSend 会返回 IPC_ERR_DEADLOCK 而不是死锁。
  */
-typedef int (*IpcDispatchFunc)(IpcContext *ctx, const IpcMessage *message,
-                               void *hostUser);
+typedef int32_t (*IpcDispatchFunc)(IpcContext *ctx, const IpcMessage *message,
+                                   void *hostUser);
 
 /* ================================================================== */
 /* 6. 统计                                                            */
@@ -392,7 +417,7 @@ typedef struct {
      *   1         —— 只校验 effective UID（为 setuid 场景放宽）。
      * 【假设】老系统原先用哪个，需要拿到源码后核对，见文末 Q6。
      */
-    int allowUidSplit;
+    int32_t allowUidSplit;
 
     /*
      * 载荷上限。这是**发送方上限**：超过自己这个值会在上线之前直接返回
@@ -412,10 +437,10 @@ typedef struct {
     uint32_t maxPayload;
 
     /* 并发同步请求槽位数（同时允许多少个 IpcSend 在等回复）。0 表示默认 64。 */
-    int maxPending;
+    int32_t maxPending;
 
     /* 发送缓冲 SO_SNDBUF，0 表示用内核默认。 */
-    int sendBufSize;
+    int32_t sendBufSize;
 
     /*
      * 接收缓冲 SO_RCVBUF，0 表示用内核默认。
@@ -423,10 +448,10 @@ typedef struct {
      * 的 SO_SNDBUF 走，按 skb truesize 计费。所以调这个值不要期待
      * 「能顶住更多在途报文」。详见 probes/PROBE_NOTES.md。
      */
-    int recvBufSize;
+    int32_t recvBufSize;
 
     /* 广播是否包含自己。0（默认）不包含。 */
-    int broadcastIncludeSelf;
+    int32_t broadcastIncludeSelf;
 
     /*
      * 【正式接入时必填】宿主事件分发入口。传 NULL 表示本模块不做任何业务
@@ -454,7 +479,7 @@ typedef struct {
  * 成功时 *outContext 为新建上下文，失败时为 NULL。
  * 同一进程可以对同一个库实例注册多个不同模块，各自独立。
  */
-int IpcRegister(const IpcModuleOptions *options, IpcContext **outContext);
+int32_t IpcRegister(const IpcModuleOptions *options, IpcContext **outContext);
 
 /*
  * 优雅注销：停止接活 → 了结挂起的同步请求 → 关 fd → **持锁状态下**
@@ -470,13 +495,13 @@ int IpcRegister(const IpcModuleOptions *options, IpcContext **outContext);
  * 两次就是 use-after-free（ASan 复现过）。守卫必须是「在对象还活着的时候
  * 同步等待」，不能只靠一个标记位。
  */
-int IpcUnregister(IpcContext *ctx);
+int32_t IpcUnregister(IpcContext *ctx);
 
 /*
  * 释放上下文内存。只能在 IpcUnregister() 完成之后调用；否则返回
  * IPC_ERR_STATE 并且什么都不释放。调用后指针即失效。
  */
-int IpcDestroy(IpcContext *ctx);
+int32_t IpcDestroy(IpcContext *ctx);
 
 /* ================================================================== */
 /* 8. 接收侧：交给宿主的 select 线程驱动                              */
@@ -490,8 +515,12 @@ int IpcDestroy(IpcContext *ctx);
  * 本模块**不持有**这个 fd 的线程归属，也**不会**自己去读它。
  *
  * 返回 >=0 为 fd，负值为错误码（上下文非法或已注销）。
+ *
+ * 类型说明：fd 在 POSIX 里的类型就是 int。这里写成 int32_t 只是为了让全文件
+ * 的统一规则不出现例外；在 Linux 的 ILP32 / LP64 上 `int` 就是 32 位，
+ * int32_t 与它属于同一类型，没有任何实际差别。
  */
-int IpcGetSelectFd(const IpcContext *ctx);
+int32_t IpcGetSelectFd(const IpcContext *ctx);
 
 /*
  * 端点可读时的处理函数：把当前已经排队的报文读干净（全程非阻塞），
@@ -514,7 +543,7 @@ int IpcGetSelectFd(const IpcContext *ctx);
  *
  * 本函数**不阻塞**：读不到就返回 0，不会等在那里。
  */
-int IpcHandleReadable(IpcContext *ctx, int maxCount);
+int32_t IpcHandleReadable(IpcContext *ctx, int32_t maxCount);
 
 /*
  * 请求停止：上下文转入停止态，不再接受新的发送，并把所有正在 IpcSend /
@@ -525,10 +554,10 @@ int IpcHandleReadable(IpcContext *ctx, int maxCount);
  *
  * 幂等。重复调用返回 IPC_OK。
  */
-int IpcRequestStop(IpcContext *ctx);
+int32_t IpcRequestStop(IpcContext *ctx);
 
 /* 已请求停止或端点已失效返回 1，正常工作中返回 0。只读查询。 */
-int IpcIsStopped(const IpcContext *ctx);
+int32_t IpcIsStopped(const IpcContext *ctx);
 
 /* ================================================================== */
 /* 9. 发送侧                                                          */
@@ -548,8 +577,8 @@ int IpcIsStopped(const IpcContext *ctx);
  * 想知道交付结果请用统计里的 recvDelivered，或改用 IpcSend。
  * 尤其注意：接收方 maxPayload 配小导致静默丢弃时，发送方仍然看到 IPC_OK。
  */
-int IpcPost(IpcContext *ctx, const char *dstModuleId, uint32_t event,
-            const void *data, size_t len);
+int32_t IpcPost(IpcContext *ctx, const char *dstModuleId, uint32_t event,
+                const void *data, size_t len);
 
 /*
  * 同步发送，等回复。
@@ -574,19 +603,19 @@ int IpcPost(IpcContext *ctx, const char *dstModuleId, uint32_t event,
  * 会阻塞，但 select 线程必须还在跑；这正是老系统「select 线程 + 回调线程池」
  * 的结构天然满足的前提。
  */
-int IpcSend(IpcContext *ctx, const char *dstModuleId, uint32_t event,
-            const void *data, size_t len,
-            void *replyBuf, size_t replyCap, size_t *outLen);
+int32_t IpcSend(IpcContext *ctx, const char *dstModuleId, uint32_t event,
+                const void *data, size_t len,
+                void *replyBuf, size_t replyCap, size_t *outLen);
 
 /*
  * 带时限的同步发送，其余语义与 IpcSend 完全一致。
  * timeoutMs < 0 等价于 IpcSend()（无限等待）；0 表示只探一次、不等待。
  * 超时返回 IPC_ERR_TIMEOUT。
  */
-int IpcSendTimeout(IpcContext *ctx, const char *dstModuleId, uint32_t event,
-                   const void *data, size_t len,
-                   void *replyBuf, size_t replyCap, size_t *outLen,
-                   int timeoutMs);
+int32_t IpcSendTimeout(IpcContext *ctx, const char *dstModuleId, uint32_t event,
+                       const void *data, size_t len,
+                       void *replyBuf, size_t replyCap, size_t *outLen,
+                       int32_t timeoutMs);
 
 /*
  * 向本命名空间内的**所有**模块广播（按配置表的固定集合逐目标发送）。
@@ -604,7 +633,7 @@ int IpcSendTimeout(IpcContext *ctx, const char *dstModuleId, uint32_t event,
  * 目的地解析之前，所以这种情况下 broadcastSkipped 保持 0，而每个目标都
  * 计入 eagainCount。引用这个行为时要说明清楚。
  */
-int IpcBroadcast(IpcContext *ctx, uint32_t event, const void *data, size_t len);
+int32_t IpcBroadcast(IpcContext *ctx, uint32_t event, const void *data, size_t len);
 
 /*
  * 回复一条收到的 IPC_MSG_TYPE_REQ。
@@ -613,7 +642,7 @@ int IpcBroadcast(IpcContext *ctx, uint32_t event, const void *data, size_t len);
  * 且每条报文**最多调一次**（第二次返回 IPC_ERR_STATE）。
  * 回复的目标地址取自称的 src（已通过凭据校验），并会回显对方的 instanceId。
  */
-int IpcReply(const IpcMessage *message, const void *data, size_t len);
+int32_t IpcReply(const IpcMessage *message, const void *data, size_t len);
 
 /* ================================================================== */
 /* 10. 诊断访问器                                                     */
@@ -629,7 +658,7 @@ const char *IpcGetSocketPath(const IpcContext *ctx); /* 本端点路径 */
 uint64_t    IpcGetInstanceId(const IpcContext *ctx); /* 本进程实例代际号 */
 
 /* 取一份统计快照；outStatistics 为 NULL 时返回 IPC_ERR_INVAL。 */
-int IpcGetStatistics(const IpcContext *ctx, IpcStatistics *outStatistics);
+int32_t IpcGetStatistics(const IpcContext *ctx, IpcStatistics *outStatistics);
 
 /* ================================================================== */
 /* 附：报头线格式（协议文档，改这里必须同步改收发两端）                */

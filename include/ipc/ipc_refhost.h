@@ -60,13 +60,13 @@ typedef struct IpcRefHost IpcRefHost;
  * 返回值：IPC_OK 表示处理成功；返回负值只会计入 dispatchFailed，
  *         不影响后续报文的处理。
  */
-typedef int (*IpcRefHandlerFunc)(const IpcMessage *message, void *user);
+typedef int32_t (*IpcRefHandlerFunc)(const IpcMessage *message, void *user);
 
 /* 参考宿主的可调参数。全零初始化取默认值。 */
 typedef struct {
-    int workers;        /* worker 线程数，钳制到 1..8，默认 2 */
-    int queueMax;       /* 回调队列深度，默认 64；满了丢报文并计数 */
-    int selectTimeoutMs;/* select 的超时（毫秒），默认 200；<=0 表示不设超时 */
+    int32_t workers;          /* worker 线程数，钳制到 1..8，默认 2 */
+    int32_t queueMax;         /* 回调队列深度，默认 64；满了丢报文并计数 */
+    int32_t selectTimeoutMs;  /* select 的超时（毫秒），默认 200；<=0 表示不设超时 */
 } IpcRefHostOptions;
 
 #define IPC_REFHOST_OPTIONS_INIT { 0 }
@@ -81,7 +81,7 @@ typedef struct {
  *
  * 成功时 *outHost 为新建对象，失败时为 NULL。
  */
-int IpcRefHostCreate(const IpcRefHostOptions *options, IpcRefHost **outHost);
+int32_t IpcRefHostCreate(const IpcRefHostOptions *options, IpcRefHost **outHost);
 
 /*
  * 现成的 IpcDispatchFunc 实现：把报文投递到本宿主的队列，由 worker 执行。
@@ -92,19 +92,19 @@ int IpcRefHostCreate(const IpcRefHostOptions *options, IpcRefHost **outHost);
  *
  * 队列满时丢弃该报文并返回 IPC_ERR_AGAIN（库会计入 dispatchFailed）。
  */
-int IpcRefHostDispatch(IpcContext *ctx, const IpcMessage *message,
-                       void *hostUser);
+int32_t IpcRefHostDispatch(IpcContext *ctx, const IpcMessage *message,
+                           void *hostUser);
 
 /*
  * 登记业务回调。
  * event 相同的重复登记返回 IPC_ERR_BUSY（不覆盖，避免静默把别人的回调顶掉）。
  * 允许在 Run 之前或之后调用。
  */
-int IpcRefHostAddHandler(IpcRefHost *host, uint32_t event,
-                         IpcRefHandlerFunc handler, void *user);
+int32_t IpcRefHostAddHandler(IpcRefHost *host, uint32_t event,
+                             IpcRefHandlerFunc handler, void *user);
 
 /* 注销一个业务回调；找不到返回 IPC_ERR_NOENT。 */
-int IpcRefHostRemoveHandler(IpcRefHost *host, uint32_t event);
+int32_t IpcRefHostRemoveHandler(IpcRefHost *host, uint32_t event);
 
 /*
  * 起 select 线程与 worker 线程池，然后**阻塞**直到 IpcRefHostStop() 被调用
@@ -114,7 +114,7 @@ int IpcRefHostRemoveHandler(IpcRefHost *host, uint32_t event);
  * （端点坏了、内存不够）。**返回值要检查**：不检查就会把「已经死掉的宿主」
  * 当成正常退出。
  */
-int IpcRefHostRun(IpcRefHost *host);
+int32_t IpcRefHostRun(IpcRefHost *host);
 
 /*
  * 请求停止并从 Run 返回。任意线程可调，幂等。
@@ -122,7 +122,7 @@ int IpcRefHostRun(IpcRefHost *host);
  * 实现上先调 IpcRequestStop()（唤醒所有在 IpcSend 里等回复的业务线程），
  * 再用自管道唤醒 select 线程，最后收掉 worker 池。
  */
-int IpcRefHostStop(IpcRefHost *host);
+int32_t IpcRefHostStop(IpcRefHost *host);
 
 /*
  * 释放宿主对象。调用前必须已经 Run 返回或没 Run 过。

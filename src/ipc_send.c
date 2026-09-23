@@ -264,13 +264,23 @@ int32_t IpcBroadcast(IpcContext *ctx, uint32_t event, const void *data, size_t l
 
 int32_t IpcReply(const IpcMessage *message, const void *data, size_t len)
 {
-    IpcReplyContext      *reply;
+    /*
+     * 显式去 const：本函数只写 reply.replied 这一个记账字段，其余字段一概不动。
+     * 这么写是为了让「宿主把 message 深拷一份丢给 worker，worker 拿着那份拷贝
+     * 调 IpcReply」这条路径成立 —— 拷贝出来的对象本来就是可写的。
+     */
+    IpcReplyToken        *reply;
     IpcContext           *ctx;
     const IpcConfigEntry *peer;
     IpcProtoHeader        header;
     int32_t               rc;
 
-    if (message == NULL || message->opaque == NULL) {
+    if (message == NULL) {
+        return IPC_ERR_INVAL;
+    }
+    reply = (IpcReplyToken *)(uintptr_t)&message->reply;
+    if (reply->ctx == NULL) {
+        /* POST / REP 上没有回复路由，或者调用者拿了一个没有 reply 的假报文。 */
         return IPC_ERR_INVAL;
     }
     if (message->type != IPC_MSG_TYPE_REQ) {
@@ -279,19 +289,16 @@ int32_t IpcReply(const IpcMessage *message, const void *data, size_t len)
     if (len > 0 && data == NULL) {
         return IPC_ERR_INVAL;
     }
-    reply = (IpcReplyContext *)message->opaque;
-    ctx   = reply->ctx;
-    if (ctx == NULL) {
-        return IPC_ERR_INVAL;
-    }
+    ctx = reply->ctx;
     if (reply->replied != 0) {
-        return IPC_ERR_STATE; /* 每条请求最多回一次 */
+        return IPC_ERR_STATE; /* 同一份回复路由最多回一次 */
     }
     rc = IpcCheckAlive(ctx);
     if (rc != IPC_OK) {
         return rc;
     }
     if (len > (size_t)ctx->maxPayload) {
+        IPC_STAT_INC(ctx, sendFailed);
         return IPC_ERR_MSGSIZE;
     }
 

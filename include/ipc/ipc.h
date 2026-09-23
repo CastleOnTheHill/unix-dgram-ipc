@@ -303,13 +303,38 @@ const IpcConfigEntry *IpcConfigFindByPath(const IpcConfig *config,
 typedef struct IpcContext IpcContext;
 
 /*
+ * 回复路由：要把一条 REP 送回请求方，需要知道的全部信息。
+ *
+ * **它按值放在 IpcMessage 里面，不是一个指向库内部对象的指针。** 这一点是
+ * 有意设计的，理由见下面 IpcMessage 的「生命周期约定」。
+ *
+ * 字段都是库填好给宿主用的，宿主只读。
+ */
+typedef struct {
+    IpcContext *ctx;                       /* 用哪个上下文回复 */
+    char        dstModuleId[IPC_NAME_MAX]; /* 回复目标 = 请求方模块标识 */
+    uint64_t    dstInstanceId;             /* 必须回显的请求方代际号 */
+    uint64_t    reqId;                     /* 必须回显的请求序号 */
+    uint32_t    event;                     /* 原样带回的事件号 */
+    int32_t     replied;                   /* 同一份 token 最多回一次 */
+} IpcReplyToken;
+
+/*
  * 交给宿主的报文视图。
  *
  * 生命周期约定（必须遵守，否则就是悬垂指针）：
- *   - 结构体本身在栈上，随便用；
- *   - ns / src / dst / data 指向库内部缓冲，**只在 dispatch 本次调用期间有效**；
- *   - 要把数据留下来，必须自己 memcpy 一份；
- *   - opaque 是库内部用的回复上下文，业务侧不要读写。
+ *   - 结构体本身由库在本次调用期间构造，**指针只在 dispatch 本次调用期间有效**；
+ *   - ns / src / dst / data 指向库内部缓冲，同样只在本次调用期间有效，
+ *     要把内容留下来必须自己 memcpy 一份；
+ *   - reply 是例外：它**按值**携带，把整个 IpcMessage 拷一份走之后，
+ *     在别的线程、别的时刻依然可以拿那份拷贝去调 IpcReply()。
+ *
+ * 为什么 reply 必须按值携带（这一条是踩过坑改过来的，别改回去）：
+ * 老系统的 dispatch 是把回调**投到线程池**的 —— 等 worker 真正跑起来时
+ * dispatch 早就返回了。如果回复所需的信息放在库的栈上，worker 手里拿到的
+ * 就是一个悬垂指针（轻则错发，重则 UAF）。而库又不能反过来去管理回调的
+ * 生命周期：那等于把「回调注册表」的职责搬进库，正是本次改造要去掉的东西。
+ * 所以结论是：**回复所需的一切必须跟着报文副本一起走**。
  *
  * 注意：src 是报文**自称**的来源，它已经过了内核凭据校验（peerUid 与配置里
  * src 对应的授权 UID 一致）才会被交到这里，所以可以信任；但不要再拿 src 去
@@ -327,7 +352,7 @@ typedef struct {
     size_t      len;         /* 载荷长度 */
     uid_t       peerUid;     /* 内核填的发送方 real UID，不可伪造 */
     pid_t       peerPid;     /* 内核填的发送方 PID，仅供日志诊断 */
-    void       *opaque;      /* 库内部用，业务侧勿动 */
+    IpcReplyToken reply;     /* 回复路由；reply.ctx == NULL 表示这条不可回复 */
 } IpcMessage;
 
 /*
@@ -344,6 +369,11 @@ typedef struct {
  *         但**不影响**库继续处理后续报文（丢弃策略由宿主自己决定、自己计数）。
  *
  * 执行线程：由宿主实现决定。老系统的做法是投递到线程池，本模块不干预。
+ *
+ * 投池的宿主注意一件事：message 的指针、以及它里面 ns / src / dst / data
+ * 指向的缓冲，只在本函数返回之前有效。要留在队列里给 worker 用，必须**整体
+ * 深拷一份**（结构体本身 + data 那一段）。reply 域是按值携带的，拷过去就能
+ * 继续用，不需要额外处理（见 IpcMessage 的说明）。
  *
  * 允许在这个函数里调用：IpcReply（仅 REQ）、IpcPost、IpcBroadcast、IpcSend。
  *   —— 其中 IpcSend 只有在线程池里执行时才安全；若宿主把 dispatch 写成
@@ -750,9 +780,24 @@ int32_t IpcBroadcast(IpcContext *ctx, uint32_t event, const void *data, size_t l
 /*
  * 回复一条收到的 IPC_MSG_TYPE_REQ。
  *
- * 必须在 dispatch 内、针对 message->type == IPC_MSG_TYPE_REQ 的报文调用，
- * 且每条报文**最多调一次**（第二次返回 IPC_ERR_STATE）。
- * 回复的目标地址取自称的 src（已通过凭据校验），并会回显对方的 instanceId。
+ * 两种用法都支持，这是本接口按值携带回复路由换来的：
+ *   - 宿主的 dispatch 内联执行回调 → 直接拿 dispatch 给的那个 message 调；
+ *   - 宿主的 dispatch 把回调投进线程池 → worker 拿**自己那份 IpcMessage 拷贝**
+ *     调（拷贝原样即可，不需要动 reply 域）。
+ *
+ * 判定这条报文能不能回：message->reply.ctx。它在 POST / REP 上是 NULL，
+ * 所以对那两种类型调用本函数会得到 IPC_ERR_INVAL，不会误发。
+ *
+ * 同一个 token 最多回一次（第二次返回 IPC_ERR_STATE）。注意这条规则是
+ * **随 token 走**的：宿主拷了几份 message 就等于拿到了几份独立的 token，
+ * 每份都能各回一次。这正是「一个队列项只回一次」的自然语义 —— 老系统的
+ * 队列项天生只有一份，所以它天然满足「每条请求回一次」。
+ *
+ * 参数上的 const 是给业务的承诺（库不改报文的业务字段），但本函数确实要写
+ * message->reply.replied 这个记账字段，所以内部做一次**显式**去 const。
+ * C 没有 mutable，这是惯用做法，不要把它理解成 const 失效。
+ *
+ * 目标地址取自报文自称的 src（已通过凭据校验），并会回显对方的 instanceId。
  */
 int32_t IpcReply(const IpcMessage *message, const void *data, size_t len);
 
@@ -840,7 +885,8 @@ int32_t IpcGetStatistics(const IpcContext *ctx, IpcStatistics *outStatistics);
  *        答：**能直接调，薄适配即可。**
  *        → 接入时只需要写一个 IpcDispatchFunc 形态的适配函数，把 IpcMessage
  *          的字段搬到老结构体上再调老入口，**不抄分发逻辑**。见
- *          include/ipc/ipc_refhost.h 顶部「正式接入时怎么办」一节。
+ *          tests/support/refhost.h 顶部「正式接入时怎么办」一节。
+ *          注意参考宿主故意**没有**放在本目录下，它不在交付物里。
  *
  *   Q4.  老系统 select 线程的循环长什么样？是否已处理「处理不完、下一轮继续」？
  *        —— 决定 IpcHandleReadable 的 maxCount 该给多少。

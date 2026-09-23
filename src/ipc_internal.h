@@ -189,25 +189,21 @@ void IpcLogEmit(const IpcContext *ctx, int32_t level, const char *format, ...)
 #define IPC_LOGE(ctx, ...) IpcLogEmit((ctx), (int32_t)IPC_LOG_ERROR, __VA_ARGS__)
 
 /* ------------------------------------------------------------------ */
-/* 回复上下文                                                         */
+/* 回复路由                                                           */
 /* ------------------------------------------------------------------ */
 
 /*
- * 交给宿主的每一条 REQ 都配一个这样的对象，指针放在 IpcMessage.opaque 里，
- * 供之后 IpcReply 使用。它只在**这一次 dispatch 调用期间**有意义 —— 库不做
- * 跨调用的引用计数（那会变成「库在管理回调生命周期」，越界了）。
+ * 回复路由就是对外头文件里的 IpcReplyToken，**不再另有一个内部结构**。
  *
- * 因此宿主的 dispatch 若把回调投到线程池，必须保证 IpcReply 在这条报文处理
- * 完之前调用，且同一时刻只有一个线程碰这个对象。这正是老系统的做法。
+ * 早先的版本在这里定义了一个库内对象、把指针放进 message->opaque，而对象本身
+ * 是 IpcDeliverToHost 的栈局部变量。那个设计只对「dispatch 内联跑回调」的宿主
+ * 成立；对老系统那种「dispatch 投线程池」的宿主，worker 拿到的是一个已经失效
+ * 的栈地址 —— 一次必然发生的 use-after-free。
+ *
+ * 现在的做法是让回复路由**按值**待在 IpcMessage 里（见 ipc.h 的 IpcReplyToken
+ * 与 IpcMessage.reply）。代价是「每条最多回一次」这条规则跟着 token 副本走，
+ * 收益是它对两种宿主形态都成立，而且库不需要去管理回调的生命周期。
  */
-typedef struct {
-    IpcContext *ctx;
-    char        dstModuleId[IPC_NAME_MAX]; /* 请求方模块，即回复的目标 */
-    uint64_t    dstInstanceId;             /* 请求方的实例代际号，必须回显 */
-    uint64_t    reqId;
-    uint32_t    event;
-    int32_t     replied;                   /* 每条请求最多回一次 */
-} IpcReplyContext;
 
 /* ------------------------------------------------------------------ */
 /* 死锁检测                                                           */

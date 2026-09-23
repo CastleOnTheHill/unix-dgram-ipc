@@ -1,8 +1,70 @@
 # libipc — AF_UNIX `SOCK_DGRAM` direct-connect IPC framework
 
-Prototype implementation of a direct-connect IPC design: modules talk straight
-to each other over Unix domain **datagram** sockets. There is no central
-forwarding server.
+Direct-connect IPC: modules talk straight to each other over Unix domain
+**datagram** sockets. There is no central forwarding server.
+
+---
+
+## 0. Read this first — the `main` branch was rewritten (2026-09-23)
+
+`main` no longer holds the frozen prototype. It now holds a **rewrite** whose
+defining constraint is that the *host* owns the threading model:
+
+- the library **creates no threads** — the legacy system's independent `select`
+  thread is reused as-is;
+- the library **keeps no callback registry** — the legacy system's registry and
+  event dispatch are reused as-is;
+- the whole seam is **two functions plus one injected callback**:
+  `IpcGetSelectFd()` / `IpcHandleReadable()` + `IpcDispatchFunc`.
+
+**The contract for `main` is [`include/ipc/ipc.h`](include/ipc/ipc.h)**, which
+is heavily commented and carries the open questions at the bottom. Start there,
+not here. Layout and testing conventions are in
+[`tests/README.md`](tests/README.md).
+
+| Branch | What it is |
+|---|---|
+| `main` | the rewrite: new transport-layer header, `src/` implementation, new test suite |
+| `legacy-prototype` | the **frozen prototype**, including its 43 review fixes. Read-only reference and fallback. |
+
+Everything from §1 down describes the **prototype** (`legacy-prototype`). It is
+kept because its kernel-behaviour measurements and its list of honest gaps are
+still the most reliable evidence in this repository, and because the prototype
+is what the rewrite is checked against. Its numbers and its API names
+(`ipc_register`, `ipc_post`, …) do **not** describe `main`.
+
+### Verification status of the rewrite — stated plainly
+
+| | |
+|---|---|
+| Compilation | **0 warnings** across 31 translation units at `-Wall -Wextra -Wpedantic -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith -Wcast-align -Wformat -Wformat-security -Wundef -Wvla -Wredundant-decls -Wswitch-enum -Winit-self`, plus all 10 headers compiling standalone |
+| Linking | **succeeds**; every `Ipc*` symbol referenced by the tests resolves inside `libipc.a` |
+| Deliverable separation | **verified mechanically** — no `IpcRefHost*` / `utest` / `main` symbols in `libipc.a`; every function declared in `include/ipc/ipc.h` has a definition |
+| Shell syntax of the test harness | **verified** (`bash -n` over all 11 scripts, with a known-broken control that is correctly rejected) |
+| Unit tests | **never executed** |
+| Integration tests | **never executed** |
+| Coverage | **not measured** |
+| Legacy compatibility | **not verified** — no legacy source or headers available |
+
+The compile/link results above were produced by cross-compiling to
+`x86_64-linux-gnu` with `ziglang`'s bundled clang. That is a real compiler
+check. **It is not a test run**: the produced ELF cannot execute on the
+development machine (`wsl.exe` is blocked by security policy and there is no
+native C toolchain on Windows). Substituting a Windows-host user-mode emulator
+was considered and **rejected**: it would translate syscalls to Windows APIs,
+where `SCM_CREDENTIALS`, `flock` and real file ownership do not exist — i.e. it
+would exercise none of the properties this project is about, while producing
+output that looks like a verdict.
+
+So: **the sentences "tests pass" and "coverage meets the 80% bar" are not
+authorised yet.** See §6 for the commands that would produce them.
+
+---
+
+# Appendix — the frozen prototype's contract
+
+*The remainder of this document describes `legacy-prototype` /
+[`REPORT.md`](REPORT.md). Kept for reference; not the current contract.*
 
 > **About the original brief.** This work started from a separate handoff
 > document (`handoff.md`) that is **not** part of this repository. Section
@@ -11,14 +73,7 @@ forwarding server.
 > actually drives a decision, it is restated in the text here, so the repository
 > stands on its own without it.
 
-This document is the **contract**. It states what was implemented, what was
-assumed, and — just as importantly — what was *not* verified. No source of the
-three legacy C IPC frameworks was available, so legacy compatibility is
-**not verified** (handoff.md §4, §14).
-
----
-
-## 1. Status at a glance
+## 1. Status at a glance (prototype)
 
 | | |
 |---|---|

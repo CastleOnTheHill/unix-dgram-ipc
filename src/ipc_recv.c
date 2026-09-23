@@ -69,12 +69,10 @@ int32_t IpcVerifySourceUid(IpcContext *ctx, const IpcProtoHeader *header,
 int32_t IpcDeliverToHost(IpcContext *ctx, const IpcProtoHeader *header,
                          const IpcCred *cred, const void *payload, size_t payloadLen)
 {
-    IpcMessage      message;
-    IpcReplyContext replyContext;
-    int32_t         rc;
+    IpcMessage message;
+    int32_t    rc;
 
     memset(&message, 0, sizeof(message));
-    memset(&replyContext, 0, sizeof(replyContext));
 
     message.ns         = header->ns;   /* 以下四个指针只在本次调用期间有效 */
     message.src        = header->src;
@@ -88,18 +86,19 @@ int32_t IpcDeliverToHost(IpcContext *ctx, const IpcProtoHeader *header,
     message.peerUid    = cred->uid;
     message.peerPid    = cred->pid;
 
+    /*
+     * 回复路由按值填进 message。这条 REQ 的回复目标、要回显的代际号与 reqId
+     * 都在这里确定，宿主把 message 深拷一份留给 worker 之后仍然能回。
+     * 非 REQ 报文让 reply.ctx 保持 NULL —— IpcReply 据此拒绝。
+     */
     if (header->type == (uint8_t)IPC_MSG_TYPE_REQ) {
-        replyContext.ctx           = ctx;
-        replyContext.reqId         = header->reqId;
-        replyContext.event         = header->event;
-        replyContext.dstInstanceId = header->instanceId; /* 要回显的是对方的代际号 */
-        replyContext.replied       = 0;
-        (void)IpcStrlcpy(replyContext.dstModuleId, header->src,
-                         sizeof(replyContext.dstModuleId));
-        message.opaque = &replyContext;
-    } else {
-        /* POST 没有回复可言，opaque 保持 NULL —— IpcReply 会据此拒绝。 */
-        message.opaque = NULL;
+        message.reply.ctx = ctx;
+        message.reply.reqId         = header->reqId;
+        message.reply.event         = header->event;
+        message.reply.dstInstanceId = header->instanceId; /* 要回显对方的代际号 */
+        message.reply.replied       = 0;
+        (void)IpcStrlcpy(message.reply.dstModuleId, header->src,
+                         sizeof(message.reply.dstModuleId));
     }
 
     IPC_STAT_INC(ctx, recvDelivered);

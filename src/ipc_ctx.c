@@ -558,6 +558,35 @@ int32_t IpcIsStopped(const IpcContext *ctx)
     return (atomic_load_explicit(&ctx->stopped, memory_order_relaxed) != 0) ? 1 : 0;
 }
 
+/*
+ * 本端点的 select fd。宿主的 select 线程在每轮循环里取一次。
+ *
+ * 【2026-09-23】这个函数之前在 src/ 下**根本没有定义** —— 头文件里声明了、
+ * 参考宿主也在调，但实现漏了，于是所有引用它的测试都链接不上。补在这里，
+ * 并且放在 IpcIsStopped 旁边：这两个函数是配套的，宿主的标准用法是
+ * 「先问 IpcIsStopped，再拿 fd」，见 tests/support/refhost.c。
+ *
+ * 返回值语义严格按 ipc.h 的约定来，不多不少：
+ *   - ctx 为 NULL            → IPC_ERR_INVAL（上下文非法）
+ *   - fd < 0                 → IPC_ERR_STATE（已注销 / 正在拆除）
+ *   - 已 IpcRequestStop 但尚未拆除 → **照常返回 fd**
+ *
+ * 最后那条是有意这样定的，别「顺手」改成返回错误：宿主把 fd 加进 fd_set 之后
+ * 才收到停止请求是正常时序，这时如果 IpcGetSelectFd 突然开始报错，宿主就得去
+ * 猜「到底该关掉哪个 fd」。判断该不该继续 select 是 IpcIsStopped 的职责，
+ * 这个函数只负责报 fd。
+ */
+int32_t IpcGetSelectFd(const IpcContext *ctx)
+{
+    if (ctx == NULL) {
+        return IPC_ERR_INVAL;
+    }
+    if (ctx->fd < 0) {
+        return IPC_ERR_STATE;
+    }
+    return ctx->fd;
+}
+
 /* ------------------------------------------------------------------ */
 /* 诊断访问器                                                         */
 /* ------------------------------------------------------------------ */

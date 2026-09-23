@@ -126,8 +126,27 @@ extern "C" {
 #define IPC_PATH_MAX            108      /* socket 路径，取自 sockaddr_un.sun_path */
 #define IPC_HDR_SIZE            112      /* 串行化报头字节数，固定宽、无填充、大端 */
 
-#define IPC_PAYLOAD_HARD_MAX    65536u   /* 单条载荷硬上限 64 KiB，配置写更大也压到这个值 */
-#define IPC_PAYLOAD_DEFAULT     8192u    /* 运行时默认载荷上限 8 KiB */
+/*
+ * 载荷上限是**两个不同角色的数**，不要当成同一个东西的一小一大：
+ *
+ *   IPC_PAYLOAD_HARD_MAX —— 天花板。任何配置都压不过它，用于兜住手滑写错的值
+ *                           （例如 maxPayload = 512 MiB），否则每个进程都会
+ *                           照着这个数去分配接收缓冲。
+ *   IPC_PAYLOAD_DEFAULT  —— 缺省值。只在 IpcModuleOptions.maxPayload 填 0
+ *                           （即「我没指定」）时使用。
+ *
+ * 两者串联，实际生效值只有一个：
+ *     maxPayload = min( opts.maxPayload ? opts.maxPayload : IPC_PAYLOAD_DEFAULT,
+ *                       IPC_PAYLOAD_HARD_MAX )
+ * 先补缺省、再压天花板，所以不会出现「默认值本身超上限」这种自相矛盾。
+ * 填 0 得 8192；填 4096 得 4096；填 1 MiB 被压到 65536。
+ *
+ * 注意这两个**不是线格式字段宽度**（区别于上面那四个）：载荷长度在报头里是
+ * 偏移 92 处的 4 字节字段，理论上限远大于此。所以 64 KiB 是设计选择
+ * （对应「消息通常很小、最大也不大」这一前提），改它不动线格式。
+ */
+#define IPC_PAYLOAD_HARD_MAX    65536u   /* 天花板：单条载荷绝对上限 64 KiB */
+#define IPC_PAYLOAD_DEFAULT     8192u    /* 缺省值：maxPayload 填 0 时取 8 KiB */
 
 /* 协议版本。接收端拒绝版本号不匹配的报文，不尝试向后兼容解析。 */
 #define IPC_PROTOCOL_VERSION    1u
@@ -384,6 +403,11 @@ typedef struct {
      * IPC_OK。因此「同一命名空间内所有模块的 maxPayload 必须一致」是
      * **部署级约束**，不是调优项。取 0 表示 IPC_PAYLOAD_DEFAULT；
      * 超过 IPC_PAYLOAD_HARD_MAX 会被压到硬上限。
+     *
+     * 实现上的安全不变量：接收端**只**按上面这个固定尺寸准备缓冲，
+     * 绝不按报头里声明的 payloadLen 去分配内存 —— 那个字段是发送方
+     * （也就是不可信的一方）说了算的。超长报文靠 recvmsg 的 MSG_TRUNC
+     * 检测出来直接丢弃，不需要先把它收下来。
      */
     uint32_t maxPayload;
 

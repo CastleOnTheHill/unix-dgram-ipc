@@ -23,14 +23,34 @@
  *       datagram arm-> SO_PASSCRED + SCM_CREDENTIALS on every message, which is
  *                      the only per-message identity a connectionless socket
  *                      offers and what libipc actually pays for
+ *     NOTE: these two are NOT equal work.  The stream arm checks identity once
+ *     per connection, the datagram arm once per message *and in both
+ *     directions*.  That asymmetry favours the baseline, i.e. it is
+ *     conservative against the candidate, and is stated here so the numbers are
+ *     not read as a like-for-like identity cost.
  *   - the stream arm does proper length-prefixed framing with read_full() /
  *     write_full() loops, so short reads and partial writes are handled
- *   - the relay arm does an O(1) name lookup into a two-entry table; nothing
- *     in it is artificially slow
+ *   - the relay arm looks its two clients up by scanning a two-entry array;
+ *     nothing in it is artificially slow.  "Two-entry" is the whole story --
+ *     there is no hash table, and the claim that it is O(1) was only ever true
+ *     in the sense that n is 2.
  *
  * What this measures is the cost of the *topology*: four socket hops and four
  * thread wakeups per request/response cycle through a relay, versus two of
  * each when the modules are connected directly.
+ *
+ * Two deliberate conservatisms, both of which make the candidate look better
+ * than a real deployment would, so they are stated rather than buried:
+ *
+ *   1. The relay is a THREAD in this process, not a separate relay process.
+ *      Real central-forwarding frameworks run a separate process, which pays a
+ *      real address-space switch and process scheduling on top of what is
+ *      measured here.  This baseline is therefore a *lower bound* on the
+ *      baseline's cost.
+ *   2. "4 hops / 4 wakeups" and "2 hops / 2 wakeups" are design values from the
+ *      topology, not measurements.  The context-switch counters printed
+ *      alongside them are measured and do not match the design value exactly
+ *      (the relay's poll() timeout adds wakeups of its own).
  *
  * It is NOT a measurement of the real legacy frameworks.  No source for any of
  * them was available (handoff.md 4).  These numbers are a synthetic control.
@@ -41,6 +61,10 @@
  * Everything runs in one process with threads, so the whole workload's CPU
  * time is accounted by getrusage(RUSAGE_SELF) -- no per-process bookkeeping
  * and no risk of charging a helper process to the wrong arm.
+ *
+ * The summary reports the MEDIAN of the repetitions (per metric), which is what
+ * report.md quotes.  Earlier versions reported the best-of-N by p50, so the
+ * headline figures in the report could not be reproduced from the tool.
  */
 
 #include <arpa/inet.h>
@@ -141,6 +165,22 @@ static int cmp_u64(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
+static int cmp_long(const void *a, const void *b)
+{
+    long x = *(const long *)a;
+    long y = *(const long *)b;
+
+    return (x > y) - (x < y);
+}
+
+static int cmp_double(const void *a, const void *b)
+{
+    double x = *(const double *)a;
+    double y = *(const double *)b;
+
+    return (x > y) - (x < y);
+}
+
 static uint64_t pct_of(const uint64_t *s, size_t n, double p)
 {
     size_t idx;
@@ -205,6 +245,8 @@ static int write_full(int fd, const void *buf, size_t n)
 typedef struct {
     double   seconds;
     uint64_t p50, p95, p99;
+    uint64_t samples;   /* round trips that actually produced a latency sample;
+                         * may be < rounds when an arm bailed out early */
     long     cpu_user_ms;
     long     cpu_sys_ms;
     long     nvcsw;
@@ -215,6 +257,153 @@ typedef struct {
     uint64_t rejected;  /* identity checks that failed */
     uint64_t truncated; /* MSG_TRUNC / MSG_CTRUNC seen */
 } ab_result_t;
+
+/* ------------------------------------------------------------------ */
+/* per-metric series over the repetitions                              */
+/* ------------------------------------------------------------------ */
+
+#define AB_MAX_REPEATS 64
+
+typedef struct {
+    int      n;
+    double   seconds[AB_MAX_REPEATS];
+    uint64_t p50[AB_MAX_REPEATS], p95[AB_MAX_REPEATS], p99[AB_MAX_REPEATS];
+    uint64_t samples[AB_MAX_REPEATS];
+    long     cpu_user_ms[AB_MAX_REPEATS], cpu_sys_ms[AB_MAX_REPEATS];
+    long     nvcsw[AB_MAX_REPEATS], nivcsw[AB_MAX_REPEATS];
+    long     rss_kb[AB_MAX_REPEATS], hwm_kb[AB_MAX_REPEATS];
+    uint64_t delivered[AB_MAX_REPEATS];
+    uint64_t rejected[AB_MAX_REPEATS];
+    uint64_t truncated[AB_MAX_REPEATS];
+} ab_series_t;
+
+static void ab_series_add(ab_series_t *s, const ab_result_t *r)
+{
+    int i = s->n;
+
+    if (i >= AB_MAX_REPEATS) {
+        return;
+    }
+    s->seconds[i]     = r->seconds;
+    s->p50[i]         = r->p50;
+    s->p95[i]         = r->p95;
+    s->p99[i]         = r->p99;
+    s->samples[i]     = r->samples;
+    s->cpu_user_ms[i] = r->cpu_user_ms;
+    s->cpu_sys_ms[i]  = r->cpu_sys_ms;
+    s->nvcsw[i]       = r->nvcsw;
+    s->nivcsw[i]      = r->nivcsw;
+    s->rss_kb[i]      = r->rss_kb;
+    s->hwm_kb[i]      = r->hwm_kb;
+    s->delivered[i]   = r->delivered;
+    s->rejected[i]    = r->rejected;
+    s->truncated[i]   = r->truncated;
+    s->n++;
+}
+
+static double med_double(const double *v, int n)
+{
+    double *t = malloc((size_t)n * sizeof(*t));
+    double  r;
+
+    if (t == NULL) {
+        return 0.0;
+    }
+    memcpy(t, v, (size_t)n * sizeof(*t));
+    qsort(t, (size_t)n, sizeof(*t), cmp_double);
+    r = (n % 2) ? t[n / 2] : 0.5 * (t[n / 2 - 1] + t[n / 2]);
+    free(t);
+    return r;
+}
+
+static uint64_t med_u64(const uint64_t *v, int n)
+{
+    uint64_t *t = malloc((size_t)n * sizeof(*t));
+    uint64_t  r;
+
+    if (t == NULL) {
+        return 0;
+    }
+    memcpy(t, v, (size_t)n * sizeof(*t));
+    qsort(t, (size_t)n, sizeof(*t), cmp_u64);
+    r = (n % 2) ? t[n / 2] : (t[n / 2 - 1] + t[n / 2]) / 2;
+    free(t);
+    return r;
+}
+
+static uint64_t min_u64(const uint64_t *v, int n)
+{
+    uint64_t m;
+    int      i;
+
+    if (n <= 0) {
+        return 0;
+    }
+    m = v[0];
+    for (i = 1; i < n; i++) {
+        if (v[i] < m) {
+            m = v[i];
+        }
+    }
+    return m;
+}
+
+static uint64_t max_u64(const uint64_t *v, int n)
+{
+    uint64_t m;
+    int      i;
+
+    if (n <= 0) {
+        return 0;
+    }
+    m = v[0];
+    for (i = 1; i < n; i++) {
+        if (v[i] > m) {
+            m = v[i];
+        }
+    }
+    return m;
+}
+
+static long med_long(const long *v, int n)
+{    long *t = malloc((size_t)n * sizeof(*t));
+    long  r;
+
+    if (t == NULL) {
+        return 0;
+    }
+    memcpy(t, v, (size_t)n * sizeof(*t));
+    qsort(t, (size_t)n, sizeof(*t), cmp_long);
+    r = (n % 2) ? t[n / 2] : (t[n / 2 - 1] + t[n / 2]) / 2;
+    free(t);
+    return r;
+}
+
+/* The median across repetitions, per metric.  Counters are not timings, so
+ * they are taken from the last repetition rather than "medianed". */
+static void ab_series_median(const ab_series_t *s, ab_result_t *out)
+{
+    int last = s->n > 0 ? s->n - 1 : 0;
+
+    memset(out, 0, sizeof(*out));
+    if (s->n == 0) {
+        return;
+    }
+    out->seconds     = med_double(s->seconds, s->n);
+    out->p50         = med_u64(s->p50, s->n);
+    out->p95         = med_u64(s->p95, s->n);
+    out->p99         = med_u64(s->p99, s->n);
+    out->samples     = s->samples[last];
+    out->cpu_user_ms = med_long(s->cpu_user_ms, s->n);
+    out->cpu_sys_ms  = med_long(s->cpu_sys_ms, s->n);
+    out->nvcsw       = med_long(s->nvcsw, s->n);
+    out->nivcsw      = med_long(s->nivcsw, s->n);
+    out->rss_kb      = s->rss_kb[last];
+    out->hwm_kb      = s->hwm_kb[last];
+    out->delivered   = s->delivered[last];
+    out->rejected    = s->rejected[last];
+    out->truncated   = s->truncated[last];
+}
 
 static long proc_kb(const char *key)
 {
@@ -463,6 +652,9 @@ static int frame_write(int fd, const unsigned char *buf, size_t len)
     return write_full(fd, buf, len);
 }
 
+/* Linear scan over at most RELAY_MAX_CLIENTS (== 2) entries.  It is called
+ * "a two-entry table" in the report, which is accurate; it is NOT a hash
+ * lookup, and with n == 2 the scan is a constant number of strcmps anyway. */
 static relay_client_t *relay_find(relay_t *r, uint32_t mod)
 {
     const char *want = (mod == MOD_A) ? "A" : "B";
@@ -602,6 +794,18 @@ static void *relay_thread(void *arg)
         }
     }
 done:
+    /* Close the client connections: this thread owns them, and a repetition
+     * loop that leaked two fds per round would run into the fd limit long
+     * before the "warm up, then repeat" protocol in the report is finished. */
+    {
+        int k;
+        for (k = 0; k < r->ncl; k++) {
+            if (r->cl[k].fd >= 0) {
+                close(r->cl[k].fd);
+                r->cl[k].fd = -1;
+            }
+        }
+    }
     free(buf);
     return NULL;
 }
@@ -638,6 +842,12 @@ static void *relay_client_b_thread(void *arg)
             break;
         }
         if (n < AB_HDR_LEN || hdr_decode(buf, &h) != 0 || h.type != AB_TYPE_REQ) {
+            atomic_fetch_add(&c->rejected, 1);
+            continue;
+        }
+        /* Same bound as the datagram arm: never frame a length the buffer
+         * cannot back. */
+        if (h.len > c->payload || n < AB_HDR_LEN + (size_t)h.len) {
             atomic_fetch_add(&c->rejected, 1);
             continue;
         }
@@ -847,6 +1057,8 @@ static int run_direct(size_t payload, uint64_t rounds, uint64_t *lat,
     pthread_join(tid, NULL);
 
     out->seconds    = (double)(t1 - t0) / 1e9;
+    /* Only the rounds that produced a sample; see the note in run_relay(). */
+    out->samples    = i;
     out->cpu_user_ms = u1 - u0;
     out->cpu_sys_ms  = s1 - s0;
     out->nvcsw      = nv1 - nv0;
@@ -916,15 +1128,13 @@ static int run_relay(size_t payload, uint64_t rounds, uint64_t *lat,
     if (a_fd < 0 || b_fd < 0) {
         fprintf(stderr, "ab_relay: cannot connect to relay: %s\n",
                 strerror(errno));
-        free(msg);
-        free(rbuf);
         if (a_fd >= 0) {
             close(a_fd);
         }
         if (b_fd >= 0) {
             close(b_fd);
         }
-        return -1;
+        goto fail_relay;
     }
 
     memset(&hello, 0, sizeof(hello));
@@ -933,12 +1143,12 @@ static int run_relay(size_t payload, uint64_t rounds, uint64_t *lat,
     hello.from  = MOD_A;
     hdr_encode(msg, &hello);
     if (frame_write(a_fd, msg, AB_HDR_LEN) != 0) {
-        return -1;
+        goto fail_clients;
     }
     hello.from = MOD_B;
     hdr_encode(msg, &hello);
     if (frame_write(b_fd, msg, AB_HDR_LEN) != 0) {
-        return -1;
+        goto fail_clients;
     }
 
     cb.fd = b_fd;
@@ -947,7 +1157,7 @@ static int run_relay(size_t payload, uint64_t rounds, uint64_t *lat,
     atomic_init(&cb.rejected, 0);
     atomic_init(&cb.delivered, 0);
     if (pthread_create(&b_tid, NULL, relay_client_b_thread, &cb) != 0) {
-        return -1;
+        goto fail_clients;
     }
 
     rusage_snapshot(&u0, &s0, &nv0, &ni0);
@@ -986,6 +1196,10 @@ static int run_relay(size_t payload, uint64_t rounds, uint64_t *lat,
     pthread_join(r_tid, NULL);
 
     out->seconds     = (double)(t1 - t0) / 1e9;
+    /* Only the rounds that really produced a sample count.  A bailed-out run
+     * must not be turned into a complete-looking percentile table by the
+     * zero-initialised tail of the latency array. */
+    out->samples     = i;
     out->cpu_user_ms = u1 - u0;
     out->cpu_sys_ms  = s1 - s0;
     out->nvcsw       = nv1 - nv0;
@@ -1001,6 +1215,28 @@ static int run_relay(size_t payload, uint64_t rounds, uint64_t *lat,
     free(msg);
     free(rbuf);
     return 0;
+
+fail_clients:
+    close(a_fd);
+    close(b_fd);
+fail_relay:
+    /* Nudge a relay thread that is still blocked in accept(): each connection
+     * lets it take one more accept() and re-check r->stop. */
+    {
+        int k;
+        for (k = 0; k < RELAY_MAX_CLIENTS; k++) {
+            int fd = connect_unix(g_path_relay);
+            if (fd >= 0) {
+                close(fd);
+            }
+        }
+    }
+    atomic_store(&r.stop, 1);
+    pthread_join(r_tid, NULL);
+    unlink(g_path_relay);
+    free(msg);
+    free(rbuf);
+    return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1014,13 +1250,19 @@ int main(int argc, char **argv)
     int            repeats = 5, csv = 0, keep = 0, i;
     char           tmpl[] = "/tmp/ab-relay-XXXXXX";
     uint64_t      *lat = NULL;
-    ab_result_t    best_d, best_r;
+    ab_series_t    sd, sr;
+    ab_result_t    med_d, med_r;
+    /* hops_design is the topology's hop count, not a measurement: see the file
+     * header.  The measured per-round-trip context switches are nvcsw+nivcsw,
+     * which do not equal the hop count. */
     static const char *hdr_csv =
         "arm,payload,rounds,sec,p50_ns,p95_ns,p99_ns,cpu_user_ms,"
-        "cpu_sys_ms,nvcsw,nivcsw,rss_kb,hwm_kb,hops,rejected";
+        "cpu_sys_ms,nvcsw,nivcsw,rss_kb,hwm_kb,hops_design,rejected";
 
-    memset(&best_d, 0, sizeof(best_d));
-    memset(&best_r, 0, sizeof(best_r));
+    memset(&sd, 0, sizeof(sd));
+    memset(&sr, 0, sizeof(sr));
+    memset(&med_d, 0, sizeof(med_d));
+    memset(&med_r, 0, sizeof(med_r));
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
@@ -1044,6 +1286,10 @@ int main(int argc, char **argv)
     }
     if (payload == 0 || payload > (1u << 20) || rounds == 0 || repeats <= 0) {
         fprintf(stderr, "ab_relay: bad parameters\n");
+        return 2;
+    }
+    if (repeats > AB_MAX_REPEATS) {
+        fprintf(stderr, "ab_relay: --repeats must be 1..%d\n", AB_MAX_REPEATS);
         return 2;
     }
 
@@ -1071,10 +1317,10 @@ int main(int argc, char **argv)
                "frameworks)\n");
         printf("  payload %zu B, round trips per repetition %" PRIu64
                ", repetitions %d\n", payload, rounds, repeats);
-        printf("  direct : A --request--> B --reply--> A        (2 hops, "
-               "2 wakeups)\n");
-        printf("  relay  : A -> relay -> B -> relay -> A        (4 hops, "
-               "4 wakeups)\n\n");
+        printf("  direct : A --request--> B --reply--> A      (2 hops, "
+               "2 wakeups -- design values)\n");
+        printf("  relay  : A -> relay -> B -> relay -> A      (4 hops, "
+               "4 wakeups -- design values)\n\n");
     }
 
     /* Warm up both arms once so the first repetition is not penalised by
@@ -1099,20 +1345,30 @@ int main(int argc, char **argv)
             free(lat);
             return 1;
         }
-        qsort(lat, (size_t)rounds, sizeof(uint64_t), cmp_u64);
-        d.p50 = pct_of(lat, (size_t)rounds, 50);
-        d.p95 = pct_of(lat, (size_t)rounds, 95);
-        d.p99 = pct_of(lat, (size_t)rounds, 99);
+        if (d.samples == 0) {
+            fprintf(stderr, "ab_relay: the direct arm produced no samples\n");
+            free(lat);
+            return 1;
+        }
+        qsort(lat, (size_t)d.samples, sizeof(uint64_t), cmp_u64);
+        d.p50 = pct_of(lat, (size_t)d.samples, 50);
+        d.p95 = pct_of(lat, (size_t)d.samples, 95);
+        d.p99 = pct_of(lat, (size_t)d.samples, 99);
 
         if (run_relay(payload, rounds, lat, &r) != 0) {
             fprintf(stderr, "ab_relay: relay arm failed\n");
             free(lat);
             return 1;
         }
-        qsort(lat, (size_t)rounds, sizeof(uint64_t), cmp_u64);
-        r.p50 = pct_of(lat, (size_t)rounds, 50);
-        r.p95 = pct_of(lat, (size_t)rounds, 95);
-        r.p99 = pct_of(lat, (size_t)rounds, 99);
+        if (r.samples == 0) {
+            fprintf(stderr, "ab_relay: the relay arm produced no samples\n");
+            free(lat);
+            return 1;
+        }
+        qsort(lat, (size_t)r.samples, sizeof(uint64_t), cmp_u64);
+        r.p50 = pct_of(lat, (size_t)r.samples, 50);
+        r.p95 = pct_of(lat, (size_t)r.samples, 95);
+        r.p99 = pct_of(lat, (size_t)r.samples, 99);
 
         if (csv) {
             printf("direct,%zu,%" PRIu64 ",%.6f,%" PRIu64 ",%" PRIu64
@@ -1129,17 +1385,17 @@ int main(int argc, char **argv)
             printf("  run %d/%d\n", i + 1, repeats);
             printf("    direct  %7.3f s  %10.0f rt/s   p50 %6" PRIu64
                    " ns  p95 %6" PRIu64 " ns  p99 %6" PRIu64 " ns\n",
-                   d.seconds, (double)rounds / d.seconds, d.p50, d.p95, d.p99);
+                   d.seconds, (double)d.samples / d.seconds, d.p50, d.p95, d.p99);
             printf("    relay   %7.3f s  %10.0f rt/s   p50 %6" PRIu64
                    " ns  p95 %6" PRIu64 " ns  p99 %6" PRIu64 " ns\n",
-                   r.seconds, (double)rounds / r.seconds, r.p50, r.p95, r.p99);
+                   r.seconds, (double)r.samples / r.seconds, r.p50, r.p95, r.p99);
             printf("    cpu     direct user+sys %ld ms   relay user+sys %ld ms"
                    "   (per round trip: %.1f us vs %.1f us)\n",
                    d.cpu_user_ms + d.cpu_sys_ms, r.cpu_user_ms + r.cpu_sys_ms,
                    (double)(d.cpu_user_ms + d.cpu_sys_ms) * 1000.0 /
-                       (double)rounds,
+                       (double)d.samples,
                    (double)(r.cpu_user_ms + r.cpu_sys_ms) * 1000.0 /
-                       (double)rounds);
+                       (double)r.samples);
             printf("    ctxsw   direct %ld vol + %ld invol   relay %ld vol + "
                    "%ld invol\n",
                    d.nvcsw, d.nivcsw, r.nvcsw, r.nivcsw);
@@ -1153,12 +1409,8 @@ int main(int argc, char **argv)
                    r.truncated, r.delivered);
         }
 
-        if (i == 0 || d.p50 < best_d.p50) {
-            best_d = d;
-        }
-        if (i == 0 || r.p50 < best_r.p50) {
-            best_r = r;
-        }
+        ab_series_add(&sd, &d);
+        ab_series_add(&sr, &r);
     }
 
     if (csv) {
@@ -1172,30 +1424,43 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    printf("-- best-of-%d summary (lowest p50), payload %zu B, %" PRIu64
-           " round trips\n", repeats, payload, rounds);
+    /* Report the median of the repetitions, per metric.  The earlier
+     * "best-of-N by lowest p50" summary could not reproduce the figures
+     * printed in the report, because those are medians. */
+    ab_series_median(&sd, &med_d);
+    ab_series_median(&sr, &med_r);
+
+    printf("-- median-of-%d summary, payload %zu B, %" PRIu64
+           " round trips per repetition\n", repeats, payload, rounds);
     printf("   %-8s %10s %12s %9s %9s %9s %12s %10s\n", "arm", "seconds",
            "rt/s", "p50 ns", "p95 ns", "p99 ns", "cpu ms", "us/rt");
     printf("   %-8s %10.3f %12.0f %9" PRIu64 " %9" PRIu64 " %9" PRIu64
            " %12ld %10.1f\n",
-           "direct", best_d.seconds, (double)rounds / best_d.seconds,
-           best_d.p50, best_d.p95, best_d.p99,
-           best_d.cpu_user_ms + best_d.cpu_sys_ms,
-           (double)(best_d.cpu_user_ms + best_d.cpu_sys_ms) * 1000.0 /
+           "direct", med_d.seconds, (double)rounds / med_d.seconds,
+           med_d.p50, med_d.p95, med_d.p99,
+           med_d.cpu_user_ms + med_d.cpu_sys_ms,
+           (double)(med_d.cpu_user_ms + med_d.cpu_sys_ms) * 1000.0 /
                (double)rounds);
     printf("   %-8s %10.3f %12.0f %9" PRIu64 " %9" PRIu64 " %9" PRIu64
            " %12ld %10.1f\n",
-           "relay", best_r.seconds, (double)rounds / best_r.seconds,
-           best_r.p50, best_r.p95, best_r.p99,
-           best_r.cpu_user_ms + best_r.cpu_sys_ms,
-           (double)(best_r.cpu_user_ms + best_r.cpu_sys_ms) * 1000.0 /
+           "relay", med_r.seconds, (double)rounds / med_r.seconds,
+           med_r.p50, med_r.p95, med_r.p99,
+           med_r.cpu_user_ms + med_r.cpu_sys_ms,
+           (double)(med_r.cpu_user_ms + med_r.cpu_sys_ms) * 1000.0 /
                (double)rounds);
-    printf("\n   delta  relay/direct: p50 %.2fx   CPU/round-trip %.2fx   "
+    printf("\n   spread over %d repetitions (min..max of each arm's p50): "
+           "direct %" PRIu64 "..%" PRIu64 " ns, relay %" PRIu64 "..%" PRIu64
+           " ns\n",
+           repeats, min_u64(sd.p50, sd.n), max_u64(sd.p50, sd.n),
+           min_u64(sr.p50, sr.n), max_u64(sr.p50, sr.n));
+    printf("   delta  relay/direct: p50 %.2fx   CPU/round-trip %.2fx   "
            "throughput %.2fx\n",
-           best_d.p50 ? (double)best_r.p50 / (double)best_d.p50 : 0.0,
-           (double)(best_r.cpu_user_ms + best_r.cpu_sys_ms) /
-               (double)(best_d.cpu_user_ms + best_d.cpu_sys_ms),
-           best_d.seconds ? best_r.seconds / best_d.seconds : 0.0);
+           med_d.p50 ? (double)med_r.p50 / (double)med_d.p50 : 0.0,
+           (double)(med_r.cpu_user_ms + med_r.cpu_sys_ms) /
+               (double)(med_d.cpu_user_ms + med_d.cpu_sys_ms),
+           med_d.seconds ? med_r.seconds / med_d.seconds : 0.0);
+    printf("   NOTE relay is a thread in this process, not a separate relay "
+           "process: the baseline is a lower bound.\n");
 
     free(lat);
     if (!keep) {

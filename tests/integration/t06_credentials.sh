@@ -138,12 +138,20 @@ annotate "missing SCM_CREDENTIALS entirely: not reachable at this layer -- with"
 annotate "  SO_PASSCRED on the receiver the kernel attaches real credentials to"
 annotate "  every AF_UNIX datagram and a sender cannot suppress them."
 annotate "  Covered by tests/unit/test_proto.c against a hand-built msghdr."
-# Assert the reserve size is exactly one credential's worth, which is *why* the
-# MSG_CTRUNC case above is reachable rather than theoretical.
+# The *behavioural* evidence for "the reserve is exactly one credential's worth"
+# is the rej_trunc assertion above: attaching a single SCM_RIGHTS was enough to
+# push the credentials out of the control buffer.
+#
+# What follows is a static check on the implementation text, not a behaviour
+# test, and it is kept because it is cheap: it confirms the macro still has the
+# shape the reasoning assumes.  It is deliberately brittle about that shape (an
+# equivalent definition moved elsewhere would fail it), and it is not coverage
+# of anything -- do not count it as such.
+annotate "IPC_CTRL_SIZE is checked statically below; the behaviour is the rej_trunc case above"
 if grep -Eq 'define[[:space:]]+IPC_CTRL_SIZE[[:space:]]+CMSG_SPACE' "$ROOT/src/ipc_loop.c"; then
-    ok "the control reserve is CMSG_SPACE(sizeof(struct ucred)): exactly one credential"
+    ok "IPC_CTRL_SIZE still textually CMSG_SPACE(...) in src/ipc_loop.c (static check)"
 else
-    fail "could not confirm the control-buffer reserve size"
+    fail "IPC_CTRL_SIZE no longer has the shape the MSG_CTRUNC reasoning assumes"
 fi
 
 all_stop

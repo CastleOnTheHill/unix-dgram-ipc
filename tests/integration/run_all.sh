@@ -16,6 +16,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 export IPC_LAB="${IPC_LAB:-/opt/ipc-lab}"
 export BUILD="${BUILD:-build}"
+# shellcheck source=lab_guard.sh
+. "$HERE/lab_guard.sh"
+guard_lab_path "$IPC_LAB" || exit 1
 
 RUN_SETUP=1
 TESTS=()
@@ -90,19 +93,24 @@ for f in "${TESTS[@]}"; do
     echo "----------------------------------------------------------------"
     echo "=== $name"
     echo "----------------------------------------------------------------"
-    if bash "$f"; then
+    rc=0
+    bash "$f" || rc=$?
+    # Classify from the verdict the *test* recorded, not from its exit status.
+    #
+    # A test can legitimately report BLOCKED and exit 0 (require_root,
+    # require_tools), and a test that fails may or may not have written its
+    # line yet.  Reading results.txt is the only way "blocked" can never be
+    # counted as "passed", which is the one thing this suite promises.
+    verdict="$(grep -E "^TEST $name (pass|fail|blocked) " "$IPC_LAB/results.txt" \
+               2>/dev/null | tail -1 | awk '{ print $3 }')"
+    if [ "$verdict" = "blocked" ]; then
+        blocked_n=$((blocked_n + 1))
+    elif [ "$verdict" = "pass" ] && [ "$rc" -eq 0 ]; then
         pass=$((pass + 1))
     else
-        rc=$?
-        # A test that reports BLOCKED exits 0 by design (require_root), so a
-        # non-zero exit here really is a failure.
-        if grep -Eq "^TEST $name blocked " "$IPC_LAB/results.txt" 2>/dev/null; then
-            blocked_n=$((blocked_n + 1))
-        else
-            fail=$((fail + 1))
-            FAILED_TESTS+=("$name")
-        fi
-        : "$rc"
+        fail=$((fail + 1))
+        FAILED_TESTS+=("$name")
+        echo "   -> recorded verdict '${verdict:-none}' with exit status $rc" >&2
     fi
 done
 finished=$(date +%s)

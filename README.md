@@ -24,7 +24,7 @@ three legacy C IPC frameworks was available, so legacy compatibility is
 |---|---|
 | Library | 3422 lines (`src/*.c`, `src/*.h`, `include/ipc/ipc.h`), C11, no dependencies beyond libc + pthread |
 | Public API | 4 legacy entry points (`ipc_register`, `ipc_post`, `ipc_send`, `ipc_broadcast`) + `ipc_reply`, `ipc_run`/`ipc_poll`, `ipc_stop`, `ipc_unregister`, `ipc_get_stats` |
-| Unit tests | 45 / 45 pass (`tests/unit`, `make check`) |
+| Unit tests | 51 / 51 pass (`tests/unit`, `make check`); 6 of them (`test_ctx.c`) cover register/post/send/broadcast/poll/stop without needing root |
 | Integration tests | 15 / 15 pass, 374 assertions (`tests/integration`, `make integration`) |
 | Sanitizers | whole integration suite replayed under ASan+UBSan: 15 / 15, 0 diagnostics across 42 captured process outputs |
 | Compiler warnings | 0 at `-O2 -Wall -Wextra -Wshadow …` (see `Makefile` `WARN`) and 0 in the ASan build |
@@ -104,9 +104,21 @@ Config format (handoff.md §5.1), one line per module:
 core A1 1001 /run/example-ipc/A/A1.sock
 ```
 
-A file must be **readable but not writable by the services**. libipc refuses at
-registration if the config is group- or world-writable, and `t04` asserts that a
-service cannot edit it.
+A file must be **readable but not writable by the services**. libipc enforces
+this at registration, for two distinct objects:
+
+* the **config file** — `stat()` plus a refusal if it is not a regular file, if
+  it is group- or world-writable, or if it is owned by a UID that is neither
+  root nor ours. The config is the trust root (it decides which UID may occupy
+  which path), so a service that can rewrite it could register as any module;
+* the **socket directory** — `check_own_dir()` refuses a directory that is
+  group/other writable, because a hostile member of the shared group could
+  otherwise swap the socket path for a symlink in the window between `bind()`
+  and `chmod()`.
+
+`t04` additionally asserts the filesystem side (the service cannot edit the
+0644 root-owned config), and `tests/unit/test_ctx.c` asserts the library side
+(0664/0666/0620 → `IPC_ERR_PERM`, 0644/0640 → accepted).
 
 | Object | Owner | Mode |
 |---|---|---|
@@ -137,8 +149,16 @@ incompatibility, and none has been verified against a real framework.**
 | 5 | Reply matching uses `(src module, echoed request id, echoed instance id)` | Only relevant if the legacy scheme differs |
 | 6 | UID check compares the **real** UID and requires real = effective = configured by default | `allow_uid_split = 1` switches to the effective UID |
 | 7 | Maximum payload 8192 by default, 65536 hard | Silently different limit from legacy |
-| 8 | Registration/`unregister` are idempotent and safe to call concurrently | — |
+| 8 | Registration is idempotent for *re-entry*; `unregister` is idempotent and safe to call concurrently, and **does not** free the context — release it with `ipc_ctx_free()` | Callers that expect `unregister` to free would leak; callers that free it themselves after `unregister` would double-free |
 | 9 | `send` waits forever by default; `ipc_send_timeout` is a separate, additive entry point | — |
+
+One deployment-level requirement is easy to miss and is therefore called out
+here: **every module in a namespace must agree on `max_payload`.** The value is
+a *sender-side* limit (a larger send fails with `IPC_ERR_MSGSIZE` before it
+reaches the wire), while the receiver's buffer is `IPC_HDR_SIZE + its own
+max_payload`. A receiver configured smaller therefore drops bigger datagrams
+silently — counted as `recv_rej_trunc` — and the **sender still sees `IPC_OK`**.
+`t05` relies on this deliberately.
 
 To close this gap, someone with the legacy headers needs to build the
 compatibility checklist in handoff.md §4 and diff it against this table.
@@ -190,6 +210,26 @@ frameworks**, and it is labelled as such in the output. Both arms verify
 identity, use the same header and payload sizes, keep the same concurrency (one
 round trip in flight) and handle framing/short reads properly.
 
+Three caveats are printed by the tool itself and matter when quoting its
+numbers:
+
+* the relay arm is a **thread inside the same process**, not a separate relay
+  process. The real legacy centre-forward is a process, with a separate address
+  space and real process scheduling; the synthetic relay is therefore **cheaper
+  than the baseline it stands in for**. The direction of the error favours the
+  candidate, so the deltas are conservative — but they are not "versus the real
+  old system".
+* the hop counts (4 vs 2) are **design values, not measurements**; the observed
+  context-switch count is reported separately and differs.
+* the arms do **not** check identity equally: the datagram arm verifies
+  `SCM_CREDENTIALS` on every datagram in both directions, while the stream arm
+  checks `SO_PEERCRED` once at `accept()`. This direction is unfavourable to the
+  candidate arm (conservative, not cheating), but the two arms are not running
+  under identical conditions.
+
+The summary statistic is the **median of N repeats**, and the tool prints the
+p50 min..max range alongside it.
+
 ---
 
 ## 7. What the tests do and do not cover
@@ -215,13 +255,22 @@ t15_stress       10 register cycles, 9-module shutdown, 20k soak     23
                                                             total   374
 ```
 
-Every wait in the suite is a **journal line with a deadline** or a process
-exit. There is exactly one place where a fixed sleep is legitimate — `t09`,
-whose subject *is* "this call blocks forever" — and it is marked as such.
+Synchronisation: every positive fact in the suite is established by a journal
+line with a deadline, by a process exit, or by a bounded poll on the counter the
+assertion reads — never by waiting a fixed amount of time. The one place where
+waiting *is* the subject is `t09` ("this call blocks forever"), and it is marked
+there. The complete inventory of remaining `sleep` sites, and why each one is
+not a proof, is in [`tests/README.md`](tests/README.md).
 
 ### Honest gaps
 
 * **Legacy compatibility: not verified.** No legacy source was available.
+* **A non-root CI run covers less than the full suite.** `src/ipc_ctx.c`,
+  `src/ipc_io.c` and `src/ipc_loop.c` were reachable only through the root-only
+  integration suite. `tests/unit/test_ctx.c` now exercises registration,
+  post/send/broadcast/reply, `ipc_poll()`, `ipc_stop()`/`ipc_is_stopped()`,
+  `ipc_socket_fd()` and teardown without any privileges, but the cross-UID
+  permission model still needs root — there is no substitute for that.
 * **`send` cancellation** is not implemented; handoff.md §8 allows it as a
   separate extension.
 * **Attribution of memory to one arm** is not possible in `ab_relay`, because

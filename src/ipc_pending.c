@@ -10,6 +10,9 @@
 
 int ipc_pending_init(ipc_pending_t *p, int cap)
 {
+    pthread_condattr_t cattr;
+    int                rc = IPC_ERR_IO;
+
     if (p == NULL || cap <= 0) {
         return IPC_ERR_INVAL;
     }
@@ -19,13 +22,36 @@ int ipc_pending_init(ipc_pending_t *p, int cap)
         return IPC_ERR_NOMEM;
     }
     p->cap = cap;
-    if (pthread_mutex_init(&p->lock, NULL) != 0 ||
-        pthread_cond_init(&p->cv, NULL) != 0) {
+    if (pthread_mutex_init(&p->lock, NULL) != 0) {
         free(p->slots);
         p->slots = NULL;
         return IPC_ERR_IO;
     }
+
+    /* The condition variable MUST run on CLOCK_MONOTONIC, because the deadline
+     * in each slot is an absolute CLOCK_MONOTONIC value (ipc_mono_ns()).  With
+     * the default CLOCK_REALTIME clock, a wall-clock step (NTP correction,
+     * manual `date`, a WSL suspend/resume) between computing the deadline and
+     * waiting would fire the timeout early or make it hang. */
+    if (pthread_condattr_init(&cattr) != 0) {
+        goto fail;
+    }
+    if (pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC) != 0) {
+        pthread_condattr_destroy(&cattr);
+        goto fail;
+    }
+    if (pthread_cond_init(&p->cv, &cattr) != 0) {
+        pthread_condattr_destroy(&cattr);
+        goto fail;
+    }
+    pthread_condattr_destroy(&cattr);
     return IPC_OK;
+
+fail:
+    pthread_mutex_destroy(&p->lock);
+    free(p->slots);
+    p->slots = NULL;
+    return rc;
 }
 
 void ipc_pending_destroy(ipc_pending_t *p)
@@ -70,7 +96,6 @@ int ipc_pending_add(ipc_pending_t *p, const char *dst, int64_t timeout_ms,
         s->reply_buf   = reply_buf;
         s->reply_cap   = reply_cap;
         s->req_id      = ++p->next_req_id;
-        s->owner_pid   = getpid();
         s->deadline_ns = 0;
         ipc_strlcpy(s->dst, dst, sizeof(s->dst));
         if (timeout_ms >= 0) {
@@ -174,15 +199,12 @@ int ipc_pending_wait(ipc_pending_t *p, int idx, size_t *reply_len_out)
                 break;
             }
             {
+                /* Absolute time on the same clock the condition variable was
+                 * created with (CLOCK_MONOTONIC): no conversion, no second
+                 * clock read, nothing for a clock step to invalidate. */
                 struct timespec ts;
-                uint64_t        left = s->deadline_ns - now;
-                clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += (time_t)(left / 1000000000ull);
-                ts.tv_nsec += (long)(left % 1000000000ull);
-                if (ts.tv_nsec >= 1000000000L) {
-                    ts.tv_sec += 1;
-                    ts.tv_nsec -= 1000000000L;
-                }
+                ts.tv_sec  = (time_t)(s->deadline_ns / 1000000000ull);
+                ts.tv_nsec = (long)(s->deadline_ns % 1000000000ull);
                 pthread_cond_timedwait(&p->cv, &p->lock, &ts);
             }
         } else {

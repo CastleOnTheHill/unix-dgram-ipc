@@ -125,7 +125,8 @@ echo "== resource accounting stays bounded"
 for n in A1 A2 B1 B2 C1 C2; do
     mod_stats "$n"
 done
-sleep 0.3
+# No settle sleep here.  mod_stats() already blocks until a *new* STATS line has
+# appeared, so once the last module has answered, every dump is on disk.
 for n in A1 A2 B1 B2 C1 C2; do
     jwait "$(journal "$n")" '^STATS ' 5 || fail "$n never produced a stats line"
 done

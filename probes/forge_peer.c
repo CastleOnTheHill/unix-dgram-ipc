@@ -23,6 +23,13 @@
  *              [--raw-hex AABBCC] [--count N] [--repeat-delay-ms N]
  *   forge_peer --conf FILE --to /path/socket.sock ...   (explicit target)
  *
+ * SAFETY: because `--to` bypasses the config table, an explicit target is only
+ * accepted when it either appears in --conf or lives under $IPC_LAB.  This is
+ * a deliberately experimental tool that can send arbitrary bytes to an
+ * arbitrary AF_UNIX datagram socket, so it stays inside the lab.  It still
+ * cannot forge SCM_CREDENTIALS -- the kernel fills those in, which is the whole
+ * point of the tests that use it.
+ *
  * Prints one line per datagram: "FORGE n=%d to=%s bytes=%zd rc=%d errno=%d".
  */
 #include <errno.h>
@@ -102,6 +109,7 @@ int main(int argc, char **argv)
     long                    bad_flags = -1, declare_len = -1, truncate = -1;
     const char             *send_fd_path = NULL;
     int                     bad_magic = 0;
+    int                     explicit_to = 0;
     ipc_config_t           *cfg = NULL;
     int                     i;
 
@@ -111,7 +119,7 @@ int main(int argc, char **argv)
         int         takes_value = 1;
 
         if (strcmp(a, "--conf") == 0 && v) conf = v;
-        else if (strcmp(a, "--to") == 0 && v) to_path = v;
+        else if (strcmp(a, "--to") == 0 && v) { to_path = v; explicit_to = 1; }
         else if (strcmp(a, "--to-module") == 0 && v) to_module = v;
         else if (strcmp(a, "--ns") == 0 && v) ns = v;
         else if (strcmp(a, "--src") == 0 && v) src = v;
@@ -155,15 +163,45 @@ int main(int argc, char **argv)
         const ipc_config_entry_t *e = ipc_config_lookup(cfg, ns, to_module);
         if (e == NULL) {
             fprintf(stderr, "no such module %s/%s in %s\n", ns, to_module, conf);
+            ipc_config_free(cfg);
             return 1;
         }
         to_path = e->path;
         if (dst == NULL) {
             dst = to_module;
         }
+    } else if (explicit_to) {
+        /* Guard rail: an explicit target is not validated by the config table,
+         * which would make this the one tool in the tree that can address an
+         * arbitrary AF_UNIX datagram socket.  Accept it only when it is a
+         * configured path, or when it lives under the test lab root. */
+        const char *lab     = getenv("IPC_LAB");
+        int         allowed = (ipc_config_lookup_path(cfg, to_path) != NULL);
+
+        if (!allowed && lab != NULL && lab[0] != '\0') {
+            size_t ll = strlen(lab);
+            allowed   = (strncmp(to_path, lab, ll) == 0 &&
+                         (to_path[ll] == '/' || to_path[ll] == '\0'));
+        }
+        if (!allowed) {
+            fprintf(stderr,
+                    "refusing --to %s: an explicit target must be listed in %s "
+                    "or live under $IPC_LAB (%s)\n",
+                    to_path, conf, (lab && lab[0]) ? lab : "unset");
+            ipc_config_free(cfg);
+            return 2;
+        }
     }
     if (dst == NULL) {
         dst = to_module ? to_module : "?";
+    }
+    /* sun_path is 108 bytes.  Every other probe in this directory checks this;
+     * this one used not to, and --to comes straight from the command line. */
+    if (strlen(to_path) >= IPC_SUN_PATH_MAX) {
+        fprintf(stderr, "target path too long (%zu bytes, max %d)\n",
+                strlen(to_path), IPC_SUN_PATH_MAX - 1);
+        ipc_config_free(cfg);
+        return 1;
     }
 
     {
@@ -175,7 +213,10 @@ int main(int argc, char **argv)
 
         if (raw_hex != NULL) {
             buf = malloc(strlen(raw_hex) / 2 + 1);
-            if (buf == NULL) return 1;
+            if (buf == NULL) {
+                ipc_config_free(cfg);
+                return 1;
+            }
             len = parse_hex(raw_hex, buf, strlen(raw_hex) / 2 + 1);
         } else {
             ipc_hdr_t      h;
@@ -210,9 +251,16 @@ int main(int argc, char **argv)
             snprintf(h.dst, sizeof(h.dst), "%s", dst);
 
             buf = malloc(IPC_HDR_SIZE + plen + 1);
-            if (buf == NULL) return 1;
+            if (buf == NULL) {
+                free(big);
+                ipc_config_free(cfg);
+                return 1;
+            }
             if (ipc_hdr_encode(&h, buf, IPC_HDR_SIZE) != IPC_HDR_SIZE) {
                 fprintf(stderr, "header encode failed\n");
+                free(buf);
+                free(big);
+                ipc_config_free(cfg);
                 return 1;
             }
             memcpy(buf + IPC_HDR_SIZE, pl, plen);
@@ -239,6 +287,8 @@ int main(int argc, char **argv)
         fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         if (fd < 0) {
             fprintf(stderr, "socket: %s\n", strerror(errno));
+            free(buf);
+            ipc_config_free(cfg);
             return 1;
         }
         memset(&sun, 0, sizeof(sun));

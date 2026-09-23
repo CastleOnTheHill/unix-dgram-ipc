@@ -305,6 +305,7 @@ static void *loop_main(void *arg)
 
     if (buf == NULL || ctrl == NULL) {
         IPC_LOGE("receive buffers: out of memory");
+        atomic_store(&ctx->loop_error, IPC_ERR_NOMEM);
     } else {
         IPC_LOGI("receive loop started (buffer %zu bytes)", cap);
         while (!atomic_load(&ctx->stopped)) {
@@ -316,7 +317,11 @@ static void *loop_main(void *arg)
                 if (errno == EINTR) {
                     continue;
                 }
+                /* A dead loop is not a graceful stop.  Record why, so
+                 * ipc_run() can tell the caller the difference instead of
+                 * returning IPC_OK for a context that no longer receives. */
                 IPC_LOGE("epoll_wait: %s", strerror(errno));
+                atomic_store(&ctx->loop_error, ipc_errno_to_rc(errno));
                 break;
             }
             for (int i = 0; i < n; i++) {
@@ -325,7 +330,16 @@ static void *loop_main(void *arg)
                     break;
                 }
                 if (ev[i].data.fd == ctx->fd) {
-                    drain_socket(ctx, buf, cap, ctrl);
+                    int drc = drain_socket(ctx, buf, cap, ctrl);
+                    if (drc < 0 && drc != IPC_ERR_AGAIN) {
+                        /* recvmsg() failed for a reason that is not "nothing
+                         * to read": the socket is broken.  Same reasoning as
+                         * the epoll_wait branch above. */
+                        IPC_LOGE("receive loop aborted: %s", ipc_strerror(drc));
+                        atomic_store(&ctx->loop_error, drc);
+                        atomic_store(&ctx->stopped, 1);
+                        break;
+                    }
                 }
             }
         }
@@ -382,6 +396,19 @@ int ipc_run(ipc_ctx_t *ctx)
     pthread_mutex_lock(&ctx->life_lock);
     pthread_cond_broadcast(&ctx->life_cv);
     pthread_mutex_unlock(&ctx->life_lock);
+
+    /* Distinguish "the caller asked us to stop" from "the receive loop died".
+     * Without this the two look identical to the caller, and a
+     * `while (running) { ... }` main loop would treat a dead context as a
+     * clean shutdown. */
+    {
+        int lerr = atomic_load(&ctx->loop_error);
+        if (lerr != 0) {
+            IPC_LOGE("ipc_run() returning %s: the receive loop failed",
+                     ipc_strerror(lerr));
+            return lerr;
+        }
+    }
     return IPC_OK;
 }
 

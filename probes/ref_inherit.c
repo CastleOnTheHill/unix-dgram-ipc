@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -262,6 +263,40 @@ static void test_flock_reference(void)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* cleanup                                                             */
+/* ------------------------------------------------------------------ */
+
+/* The probe used to leave /tmp/ipc_ref_inherit_<pid>/ behind on every run --
+ * harmless because the name carries the pid, but it means t13 (which runs this
+ * as root) quietly accumulates scratch trees on the test host.  Nothing here
+ * is shared, so removing the whole tree is safe. */
+static void cleanup_dir(void)
+{
+    static const char *const names[] = { "mod.sock", "other.sock", "mod.lock",
+                                         "flock_result.txt" };
+    char                      p[sizeof(g_dir) + 32];
+    size_t                    i;
+    int                       failed = 0;
+
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (snprintf(p, sizeof(p), "%s/%s", g_dir, names[i]) >= (int)sizeof(p)) {
+            continue;
+        }
+        if (unlink(p) != 0 && errno != ENOENT) {
+            failed = 1;
+        }
+    }
+    if (rmdir(g_dir) != 0) {
+        failed = 1;
+    }
+    if (failed) {
+        printf("RESULT cleanup_incomplete dir=%s errno=%d\n", g_dir, errno);
+    } else {
+        printf("RESULT cleanup_ok dir=%s\n", g_dir);
+    }
+}
+
 int main(void)
 {
     /* Children terminate with _exit(), which does not flush stdio.  Line
@@ -272,7 +307,37 @@ int main(void)
         perror("mkdir");
         return 1;
     }
+
+    /* Section 2 forks a process that forks again and then vanishes, so the
+     * grandchild is reparented.  Without this it is adopted by init and can
+     * outlive the probe while still holding mod.lock; with it, the grandchild
+     * lands back on us and we can actually wait for it.  Not fatal if the
+     * kernel refuses: the probe still measures what it measures, it just may
+     * leave an orphan (and says so). */
+    if (prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0) {
+        printf("NOTE subreaper_unavailable errno=%d (an orphan may survive)\n",
+               errno);
+    }
+
     test_socket_reference();
     test_flock_reference();
+
+    /* Reap anything that was reparented to us, bounded.  The grandchild writes
+     * its last line and then exits, so this normally returns immediately. */
+    {
+        int i;
+        for (i = 0; i < 500; i++) {
+            pid_t w = waitpid(-1, NULL, WNOHANG);
+            if (w == -1) {
+                break; /* ECHILD: nothing left to wait for */
+            }
+            if (w > 0) {
+                continue;
+            }
+            usleep(10000);
+        }
+    }
+
+    cleanup_dir();
     return 0;
 }

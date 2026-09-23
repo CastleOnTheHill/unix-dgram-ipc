@@ -214,11 +214,11 @@ uint64_t ipc_gen_instance_id(void)
     return v ? v : 1;
 }
 
-char *ipc_read_file(const char *path, size_t max_bytes, int *out_err)
+char *ipc_read_file(const char *path, size_t initial_cap, int *out_err)
 {
     int    fd;
     char  *buf;
-    size_t cap = max_bytes ? max_bytes : 65536;
+    size_t cap = initial_cap ? initial_cap : 65536;
     size_t len = 0;
 
     if (out_err != NULL) {

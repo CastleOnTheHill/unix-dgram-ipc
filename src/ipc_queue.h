@@ -47,8 +47,12 @@ int ipc_queue_push(ipc_queue_t *q, const ipc_hdr_t *hdr, const ipc_cred_t *cred,
                    const void *payload, size_t len);
 
 /* Pop one task.  Returns IPC_OK, IPC_ERR_AGAIN when empty and non-blocking,
- * or IPC_ERR_STOPPED when shut down (also when the queue drains and the
- * shutdown flag is set, so workers always terminate). */
+ * or IPC_ERR_STOPPED.
+ *
+ * Order of the two conditions matters: a blocked pop keeps returning queued
+ * items after ipc_queue_shutdown() and only reports IPC_ERR_STOPPED once the
+ * queue is empty *and* the shutdown flag is set.  That is what lets the worker
+ * pool drain the backlog it already accepted instead of dropping it. */
 int ipc_queue_pop(ipc_queue_t *q, ipc_task_t *out, int block);
 
 /* Frees a task's payload, leaving the struct zeroed. */

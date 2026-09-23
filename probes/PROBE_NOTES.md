@@ -1,10 +1,16 @@
 # PROBE_NOTES.md — kernel behaviour this framework depends on
 
-Every claim here was **measured on the verification host**, not copied from a
-man page or from general "UDP-like" intuition. The probes are in this directory
-and each one prints the observations verbatim; the assertions in the
-integration suite and the comments in `src/` point back to this file instead of
-restating folklore.
+Every claim here points at a **reproducible artefact inside this repository** —
+a probe in this directory, a benchmark, or an integration test — and each
+artefact prints its observations verbatim; the assertions in the integration
+suite and the comments in `src/` point back to this file instead of restating
+folklore.
+
+Where the artefact is *not* a file in this directory, it is named explicitly at
+the claim (see §2c and §3a, whose evidence lives in an integration test and in a
+benchmark respectively). An earlier revision of this paragraph said "the probes
+are in this directory", which was not true of every section; each section now
+carries its own **Source:** line.
 
 Target: handoff.md §10 ("do not copy network-UDP tuning to AF_UNIX; the message
 limit and the queue-full condition must be established against the actual
@@ -74,8 +80,12 @@ a supplementary group other than its primary one to observe the `chown` case).
 ## 2. `SO_RCVBUF` does not size an AF_UNIX datagram receive queue, and the
    queue-full condition is charged to the **sender**
 
-**Probes:** `queue_probe.c` (parameter sweep) and `probe_sock_semantics.py`
-(sanity cross-check).
+**Sources:** §2a/§2b/§2d/§2e — `queue_probe.c` (parameter sweep), with
+`probe_sock_semantics.py` as an independent cross-check of §2a.  §2c is *not*
+a probe result: it comes from `tests/integration/t08_congestion.sh`, which is
+the only artefact in the tree that has both a stalled and a healthy peer at the
+same time.  `queue_probe.c` deliberately has a single receiver that never reads
+and never sends to a nonexistent path, so it cannot show §2c at all.
 
 **Setup:** one bound `SOCK_DGRAM` receiver that never reads, one non-blocking
 bound sender; fill until `sendto()` fails.
@@ -130,6 +140,14 @@ Same 64-byte payload, holding `SO_RCVBUF` constant and sweeping the **sender's**
 charged to the sender's `sk_wmem_alloc` at `sendto()` time and is only released
 when the receiver actually reads it.
 
+**Read that ~800 as an inferred value, not a measured one.** No probe prints
+`truesize`, and the four quotients above are 8192/11 = 745, 131072/171 = 766,
+212992/278 = 766 and 425984/513 = 830 — spread ±6 % around 800, from a single
+run each. The structural explanation (payload + `struct sk_buff` + alignment) is
+sound, and `accepted ∝ SO_SNDBUF` is directly measured; the constant is obtained
+by dividing one measurement by another. Treat it as "roughly 800 B on this
+kernel", not as a bit-exact per-message cost.
+
 ### 2c. This produces *head-of-line blocking across every destination*
 
 Because the charge sits on the **sender's** socket, a sender that also talks to
@@ -139,6 +157,13 @@ addressed. `tests/integration/t08_congestion.sh` asserts this directly: with
 one peer paused, a broadcast reaches **0** healthy peers, and
 `broadcast_skipped` stays 0 because `EAGAIN` is decided before the destination
 is even resolved. Killing the stalled peer restores the budget immediately.
+`t08` also settles the *ordering* half of the claim: three of the eight
+broadcast targets (`A3`/`B3`/`C3`) have no socket at all, and they too come back
+`EAGAIN` rather than `ENOENT` — a path that does not exist can only fail with
+"would block" if the budget check happens before the destination is resolved.
+
+**Source:** `tests/integration/t08_congestion.sh`. This is the one section of
+§2 that is *not* a probe result (see the source note at the top of §2).
 
 This is a design-level property, not a bug. It is recorded because the
 temptation is to describe congestion as "per-target", which would be wrong.
@@ -176,7 +201,8 @@ part of the sender's budget. The empty-receiver numbers above come from
 
 ## 3. `SCM_CREDENTIALS` reports the sender's **real** UID
 
-**Probe:** `cred_probe.c`
+**Source:** `cred_probe.c` (Part 1: which UID the kernel *fills in*; Part 2:
+whether a sender can supply its own instead).
 
 A child calls `setresuid(real=65530, effective=65531, saved=65531)` and sends
 one datagram; the receiver has `SO_PASSCRED` on and prints the `struct ucred`:
@@ -184,6 +210,18 @@ one datagram; the receiver has `SO_PASSCRED` on and prints the `struct ucred`:
 ```
 RESULT SCM_CREDENTIALS pid=5232 uid=65530 gid=0
 CONCLUSION kernel reports the REAL uid
+```
+
+Part 2 measures the half that used to be asserted rather than measured: an
+**unprivileged** child calls `sendmsg()` with an explicit `SCM_CREDENTIALS`
+naming uid 0. The kernel refuses the datagram outright (`EPERM`), so nothing is
+queued and the receiver sees no datagram:
+
+```
+FORGE sender uid=65530 euid=65530 claiming uid=0
+FORGED_SEND_REJECTED errno=1 (Operation not permitted)
+CONCLUSION kernel refused the forged credential
+CONCLUSION forged credential refused, no datagram queued
 ```
 
 This settles handoff.md §4 item 8 as far as it can be settled without the old
@@ -205,6 +243,9 @@ processed with partial credentials. The probe forces this with
 `forge_peer --send-fd`.
 
 ### 3a. Corollary: `SO_PASSCRED` must be enabled before the first datagram arrives
+
+**Source:** `tests/bench/ab_relay.c`, not a probe — it has the two sockets and
+the receive thread whose startup order is being observed.
 
 Measured while building the A/B harness (`tests/bench/ab_relay.c`): a datagram
 that is already queued when `SO_PASSCRED` is turned on is delivered **without**
@@ -290,8 +331,21 @@ because each one is a place where an intuitive assumption is wrong:
 ```bash
 # inside WSL, in a Linux-native copy of the tree (never /mnt/c)
 make all                              # builds probes into ./build/bin
-./build/bin/queue_probe               # sections 2a-2e
-sudo ./build/bin/cred_probe           # section 3   (needs root for setresuid)
+./build/bin/queue_probe               # sections 2a-2e   (§2c is NOT here: t08)
+sudo ./build/bin/cred_probe           # section 3, parts 1 and 2 (needs root)
 ./build/bin/ref_inherit               # section 4
 python3 probes/probe_sock_semantics.py  # section 1 (and a cross-check of 2)
 ```
+
+Two of the artefacts named above are not probes and are not covered by those
+five commands — they are part of the suites:
+
+```bash
+sudo bash tests/integration/run_all.sh t08_congestion.sh   # section 2c
+./build/bin/rt_baseline                                    # §5's floor: 0.77 / 31.5 us
+./build/bin/ab_relay --size 256 --rounds 20000 --repeats 5 # section 3a
+```
+
+`rt_baseline` is listed here because `REPORT.md` §5.2 quotes its two numbers;
+it is a benchmark (`tests/bench` is only `ipc_bench` and `ab_relay`, so
+`rt_baseline` builds into `probes/`) and it was missing from this list.

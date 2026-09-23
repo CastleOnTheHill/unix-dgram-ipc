@@ -8,9 +8,16 @@
 # run there would prove nothing.
 #
 # Synchronisation rule for the whole suite: a test waits for a *journal line*
-# (with a deadline) or for a process to exit.  There is exactly one place where
-# a fixed sleep is legitimate -- the test whose subject is "this call blocks
-# forever" -- and it is marked as such.
+# (with a deadline) or for a process to exit.  Fixed sleeps do exist, but none
+# of them is used to prove that a service has started or that a queue has
+# filled -- those are always journal lines.  The complete list is in
+# tests/README.md; the one place where waiting *is* the subject of the test is
+# t09 ("this call blocks forever"), and it is marked there.
+#
+# (An earlier revision of this comment claimed there was exactly one fixed
+# sleep in the suite.  That was wrong; the claim now lives in tests/README.md,
+# together with the complete list of remaining sleeps and why none of them is a
+# proof.)
 
 set -uo pipefail
 
@@ -24,6 +31,13 @@ ROOT="$(cd "$COMMON_DIR/../.." && pwd)"
 # clearly-named tree that cannot collide with a production socket root, and
 # /opt is traversable by every test identity (unlike a private $HOME).
 export IPC_LAB="${IPC_LAB:-/opt/ipc-lab}"
+# ...and lab_guard.sh is what enforces that sentence instead of merely
+# asserting it.  A rejected path is a configuration error,
+# so it is a hard exit: "blocked" is reserved for "the machine cannot run this
+# test", not for "the caller handed us a dangerous path".
+# shellcheck source=lab_guard.sh
+. "$COMMON_DIR/lab_guard.sh"
+guard_lab_path "$IPC_LAB" || exit 2
 
 export LAB="$IPC_LAB"
 export LAB_CONF="$LAB/conf/ipc-modules.conf"
@@ -82,7 +96,18 @@ assert_re() {
 }
 
 # assert_no_re <file> <regex> <message>
+#
+# The file has to exist first.  `grep` on a missing file returns non-zero for a
+# reason that has nothing to do with the pattern, so without this check "the
+# forbidden line never appeared" and "this journal was never created (wrong
+# path, module never started)" are indistinguishable -- the assertion passes
+# for the wrong reason and reports a false negative.  assert_re() above cannot
+# be fooled this way, because a missing file fails there anyway.
 assert_no_re() {
+    if [ ! -e "$1" ]; then
+        fail "$3: journal $(basename "$1") does not exist, so absence of /$2/ is unprovable"
+        return
+    fi
     if grep -Eq -- "$2" "$1" 2>/dev/null; then
         fail "$3: unexpected /$2/ in $(basename "$1")"
     else
@@ -485,11 +510,36 @@ require_root() {
     fi
 }
 
+# require_tools <tool|path>... -- a missing tool is BLOCKED, never a pile of
+# mysterious failures.  Every integration test assumes the lab binaries,
+# `setpriv` and `python3` are present, but only `ipc_testmod` was ever checked,
+# so e.g. a missing `forge_peer` surfaced as a dozen "could not send the probe"
+# failures.  "I could not test it" and "it failed" must not look alike -- the
+# same reason require_root reports BLOCKED instead of letting the tests fail.
+require_tools() {
+    local missing=() t
+    for t in "$@"; do
+        case "$t" in
+            */*) [ -x "$t" ] || missing+=("$t") ;;
+            *)   command -v "$t" >/dev/null 2>&1 || missing+=("$t") ;;
+        esac
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        blocked "missing required tool(s): ${missing[*]}"
+        printf 'TEST %s blocked 0\n' "$TEST_NAME" >>"$RESULTS_FILE"
+        exit 0
+    fi
+}
+
 require_lab() {
     if [ ! -x "$LAB_BIN/ipc_testmod" ]; then
         echo "lab not prepared; run tests/integration/setup_lab.sh first" >&2
         exit 2
     fi
+    # Suite-wide prerequisites.  setup_lab.sh installs forge_peer unconditionally
+    # (it fails if the build is missing it), setpriv is what every test uses to
+    # change identity, and python3 backs the small bind/unlink/append probes.
+    require_tools "$LAB_BIN/forge_peer" setpriv python3
 }
 
 trap all_stop EXIT

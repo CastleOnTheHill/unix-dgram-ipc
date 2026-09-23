@@ -2,6 +2,13 @@
 # not published; section references to it are explained in README.md/REPORT.md.
 handoff.md
 
+# The code-review report written against this prototype. Also an internal
+# document, and excluded for the same reason: every finding that changed code,
+# tests or documentation is restated where it applies, so the tree does not
+# depend on the report to be readable. Kept out of git so a `git add .` cannot
+# publish it by accident.
+REVIEW.md
+
 # Reference material (third-party coding standards, vendor specs). Not ours to
 # publish: it includes a Huawei DKBA specification and OpenHarmony guides.
 .refs/

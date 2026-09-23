@@ -6,40 +6,84 @@ import os, shutil, socket, sys, tempfile
 D = tempfile.mkdtemp(prefix="ipc-sock-semantics-")
 
 
-def t_fchown_fd_effect():
+def t_fchmod_fchown_fd_effect():
+    """Section 1: are attribute changes through the *fd* really no-ops?
+
+    Both halves are measured.  The library's permission story rests on "the fd
+    form does nothing, only the path form takes effect", so fchmod() and
+    fchown() each get their own control (the same request made through the
+    path), and neither is extrapolated from the other.
+    """
     p = os.path.join(D, "a.sock")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     s.bind(p)
-    before = os.stat(p).st_gid
+    before_mode = os.stat(p).st_mode & 0o7777
+    before_gid = os.stat(p).st_gid
+    fd = s.fileno()
+
+    # ---- fchmod(fd) vs chmod(path) -------------------------------------
+    try:
+        os.fchmod(fd, 0o620)
+        after = os.stat(p).st_mode & 0o7777
+        print("fchmod(fd)   mode %s -> %s (requested 0620) : %s" %
+              (oct(before_mode), oct(after),
+               "EFFECTIVE" if after == 0o620 else "NO-OP"))
+    except OSError as e:
+        print("fchmod(fd) FAIL:", e)
+    try:
+        os.chmod(p, 0o620)
+        after = os.stat(p).st_mode & 0o7777
+        print("chmod(path)  mode %s -> %s (requested 0620) : %s" %
+              (oct(before_mode), oct(after),
+               "EFFECTIVE" if after == 0o620 else "NO-OP"))
+    except OSError as e:
+        print("chmod(path) FAIL:", e)
+
+    # ---- fchown(fd) vs chown(path) -------------------------------------
     other = [g for g in os.getgroups() if g != os.getegid()]
     if not other:
-        print("fchown test: skipped (no other group)")
-        s.close(); os.unlink(p); return
-    g = other[0]
-    try:
-        os.fchown(s.fileno(), -1, g)
-        r1 = os.stat(p).st_gid
-        print("fchown(fd)   gid %s -> %s (requested %s) : %s" % (before, r1, g, "EFFECTIVE" if r1 == g else "NO-OP"))
-    except OSError as e:
-        print("fchown(fd) FAIL:", e)
-    os.chown(p, -1, os.getegid())
-    try:
-        os.chown(p, -1, g)
-        r2 = os.stat(p).st_gid
-        print("chown(path)  gid %s -> %s (requested %s) : %s" % (before, r2, g, "EFFECTIVE" if r2 == g else "NO-OP"))
-    except OSError as e:
-        print("chown(path) FAIL:", e)
-    s.close(); os.unlink(p)
+        print("fchown test: skipped (the invoking user has no supplementary "
+              "group other than its primary one, so there is no gid to change "
+              "to)")
+    else:
+        g = other[0]
+        try:
+            os.fchown(fd, -1, g)
+            r1 = os.stat(p).st_gid
+            print("fchown(fd)   gid %s -> %s (requested %s) : %s" %
+                  (before_gid, r1, g, "EFFECTIVE" if r1 == g else "NO-OP"))
+        except OSError as e:
+            print("fchown(fd) FAIL:", e)
+        try:
+            os.chown(p, -1, os.getegid())
+            os.chown(p, -1, g)
+            r2 = os.stat(p).st_gid
+            print("chown(path)  gid %s -> %s (requested %s) : %s" %
+                  (before_gid, r2, g, "EFFECTIVE" if r2 == g else "NO-OP"))
+        except OSError as e:
+            print("chown(path) FAIL:", e)
+
+    s.close()
+    os.unlink(p)
 
 
 def t_umask_on_bind():
-    p = os.path.join(D, "b.sock")
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    old = os.umask(0o077)
-    s.bind(p)
-    os.umask(old)
-    print("bind under umask 0077 -> mode %s" % oct(os.stat(p).st_mode))
-    s.close(); os.unlink(p)
+    """Section 1, second claim: bind() applies the process umask.
+
+    Measured at both umask settings that matter, rather than measured at 0077
+    and extrapolated to 0022.
+    """
+    for um in (0o077, 0o022):
+        p = os.path.join(D, "b%03o.sock" % um)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        old = os.umask(um)
+        try:
+            s.bind(p)
+        finally:
+            os.umask(old)
+        print("bind under umask %04o -> mode %s" % (um, oct(os.stat(p).st_mode)))
+        s.close()
+        os.unlink(p)
 
 
 def t_rcvbuf():
@@ -98,15 +142,13 @@ def t_max_dgram():
     w.close(); r.close(); os.unlink(rp)
 
 
-t_fchown_fd_effect()
-t_umask_on_bind()
-t_rcvbuf()
-t_max_dgram()
-
-# Clean up after ourselves.  Every socket in D is already unlinked by its own
-# case; this only removes the directory, and it must not take the interpreter
-# down with it if a case bailed out early.
+# Every case runs inside the try, so an exception in one of them cannot leave
+# the whole scratch tree (and the sockets in it) behind: cleanup is in the
+# finally, not after the last call.
 try:
-    shutil.rmtree(D)
-except OSError as exc:
-    print("NOTE: could not remove %s: %s" % (D, exc), file=sys.stderr)
+    t_fchmod_fchown_fd_effect()
+    t_umask_on_bind()
+    t_rcvbuf()
+    t_max_dgram()
+finally:
+    shutil.rmtree(D, ignore_errors=True)

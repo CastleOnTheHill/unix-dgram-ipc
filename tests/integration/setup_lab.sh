@@ -21,6 +21,11 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 LAB="${IPC_LAB:-/opt/ipc-lab}"
+# This script ends up doing `rm -rf "$LAB/run" ...` as root, so the path has to
+# be validated before anything else happens.
+# shellcheck source=lab_guard.sh
+. "$HERE/lab_guard.sh"
+guard_lab_path "$LAB" || exit 1
 # Which build tree to install from.  The sanitizer variant lives in a separate
 # tree on purpose (handoff.md 10: "debug, ASan/UBSan and performance builds
 # must be kept apart"), so the same suite can be replayed under ASan with

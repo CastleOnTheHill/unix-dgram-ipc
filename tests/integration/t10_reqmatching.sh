@@ -109,7 +109,12 @@ echo "== a reply from the wrong module cannot complete a request"
 instance="$(jfield "$(journal A1)" '^BOOT module=' instance)"
 mod_cmd B1 "behave 802 block:1200"
 mod_cmd A1 "sendt 250 B1 802 will-timeout"
-sleep 0.4
+# Wait for the request to be *outstanding* before forging its reply.  The
+# `SEND begin` line is written after the pending slot is registered, which is
+# exactly the window this test needs; a fixed sleep here would be guessing at a
+# boundary the tool already publishes.
+jwait "$(journal A1)" '^SEND begin op=sendt dst=B1 event=802' 5 \
+    || fail "A1 never reported starting the request to B1"
 # Feed A1 a forged REP carrying A1's own instance id but a request id it never
 # issued; the source is A2, which A1 has no outstanding request to.
 forge "$UID_A" --to-module A1 --src A2 --dst A1 --type rep --event 802 \
@@ -122,9 +127,14 @@ else
 fi
 assert_no_re "$(journal A1)" 'reply=forged' "the forged payload never surfaced as a reply"
 
-sleep 0.3
-mod_stats A1
-jwait "$(journal A1)" '^STATS ' 5
+# Bounded poll on the counter the assertion reads: A1's receive thread has to
+# process the forged reply before reply_unmatched moves.
+for _ in $(seq 1 30); do
+    mod_stats A1
+    _u="$(jfield "$(journal A1)" '^STATS' reply_unmatched)"
+    [ "${_u:-0}" -ge 2 ] && break
+    sleep 0.1
+done
 assert_eq "$(jfield "$(journal A1)" '^STATS' reply_unmatched)" "2" \
           "the forged reply from the wrong source was counted as unmatched"
 
@@ -135,9 +145,12 @@ echo "== a reply addressed to a previous instance is refused"
 # instance id is *wrong* is discarded before the pending table is consulted.
 forge "$UID_A" --to-module A1 --src A2 --dst A1 --type rep --event 803 \
       --req-id 1 --instance-id 0xdeadbeefdeadbeef --payload stale >/dev/null
-sleep 0.3
-mod_stats A1
-jwait "$(journal A1)" '^STATS ' 5
+for _ in $(seq 1 30); do
+    mod_stats A1
+    _u="$(jfield "$(journal A1)" '^STATS' reply_unmatched)"
+    [ "${_u:-0}" -ge 3 ] && break
+    sleep 0.1
+done
 assert_eq "$(jfield "$(journal A1)" '^STATS' reply_unmatched)" "3" \
           "the wrong-instance reply was counted as unmatched"
 assert_eq "$(jcount "$(journal A1)" 'reply=stale')" "0" \

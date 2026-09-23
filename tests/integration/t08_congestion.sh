@@ -187,13 +187,28 @@ if jwait "$(journal A2)" '^BLAST ' 20; then
 else
     fail "the burst never reported a result"
 fi
-# Let the worker drain what it accepted.
-sleep 1
-mod_stats C2
-jwait "$(journal C2)" '^STATS ' 5
-invoked="$(jfield "$(journal C2)" '^STATS' cb_invoked)"
-dropped="$(jfield "$(journal C2)" '^STATS' cb_dropped)"
-echo "   burst_ok=$burst_ok invoked=$invoked dropped=$dropped"
+# Poll the *expression the assertion below reads*, not a duration and not a
+# single counter.  Everything the socket accepted is eventually either invoked
+# or dropped, but the tail sits in the 2-slot callback queue while the 400 ms
+# handler finishes -- so `dropped > 0` alone stops the wait two datagrams early
+# (exactly the queue bound) and the accounting assertion then fails on a race.
+# Waiting for `invoked + dropped >= burst_ok` is the real convergence condition;
+# it is bounded, so a stuck worker still terminates the loop.
+settled=0
+invoked=0
+dropped=0
+for _ in $(seq 1 150); do
+    mod_stats C2
+    invoked="$(jfield "$(journal C2)" '^STATS' cb_invoked)"
+    dropped="$(jfield "$(journal C2)" '^STATS' cb_dropped)"
+    if [ $(( ${invoked:-0} + ${dropped:-0} )) -ge "${burst_ok:-0}" ] &&
+       [ "${dropped:-0}" -gt 0 ]; then
+        settled=1
+        break
+    fi
+    sleep 0.1
+done
+echo "   burst_ok=$burst_ok invoked=$invoked dropped=$dropped settled=$settled"
 if [ "${dropped:-0}" -gt 0 ]; then
     ok "$dropped callbacks were dropped once the queue was full"
 else

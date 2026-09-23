@@ -43,7 +43,15 @@ done
 echo
 echo "== unicast, one per UID pair"
 mod_cmd A1 "post B1 14 hello-b1"
-assert_re "$(journal A1)" '^POST dst=B1 event=14 rc=0' "A1 posts to B1"
+# jwait, not assert_re.  mod_cmd only writes the command into the FIFO; the
+# module has not necessarily parsed it yet.  Checking straight away wins
+# normally but loses under a slow scheduler, and fail() never retries, so a
+# lost race would leave a permanent FAIL behind.
+if jwait "$(journal A1)" '^POST dst=B1 event=14 rc=0' 5; then
+    ok "A1 posts to B1"
+else
+    fail "A1 produced no POST result for B1"
+fi
 if jwait "$(journal B1)" "$(recv_re A1 B1 14)" 5; then
     ok "B1 received A1's message"
     assert_re "$(journal B1)" 'event=14 .*data=hello-b1' "payload delivered intact"
@@ -52,7 +60,11 @@ else
 fi
 
 mod_cmd B2 "post C3 14 hello-c3"
-assert_re "$(journal B2)" '^POST dst=C3 event=14 rc=0' "B2 posts to C3"
+if jwait "$(journal B2)" '^POST dst=C3 event=14 rc=0' 5; then
+    ok "B2 posts to C3"
+else
+    fail "B2 produced no POST result for C3"
+fi
 if jwait "$(journal C3)" "$(recv_re B2 C3 14)" 5; then
     ok "C3 received B2's message"
     assert_re "$(journal C3)" 'src=B2 dst=C3' "source and destination fields correct"
@@ -61,7 +73,11 @@ else
 fi
 
 mod_cmd C1 "post A2 14 hello-a2"
-assert_re "$(journal C1)" '^POST dst=A2 event=14 rc=0' "C1 posts to A2"
+if jwait "$(journal C1)" '^POST dst=A2 event=14 rc=0' 5; then
+    ok "C1 posts to A2"
+else
+    fail "C1 produced no POST result for A2"
+fi
 if jwait "$(journal A2)" "$(recv_re C1 A2 14)" 5; then
     ok "A2 received C1's message"
 else

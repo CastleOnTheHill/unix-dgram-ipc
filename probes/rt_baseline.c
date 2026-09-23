@@ -51,11 +51,18 @@ static uint64_t pct_of(const uint64_t *sorted, size_t n, double p)
     return sorted[idx];
 }
 
-static void report(const char *label, uint64_t *s, size_t n)
+static void report(const char *label, uint64_t *s, size_t n, size_t planned)
 {
     uint64_t sum = 0;
     size_t   i;
 
+    if (n == 0) {
+        /* Error paths `break` out of the measurement loop.  Saying so beats
+         * feeding the statistics a tail of zeros, which would drag min/p50
+         * down and make a failed run look like a fast one. */
+        printf("  %-12s no samples\n", label);
+        return;
+    }
     qsort(s, n, sizeof(uint64_t), cmp_u64);
     for (i = 0; i < n; i++) {
         sum += s[i];
@@ -64,6 +71,10 @@ static void report(const char *label, uint64_t *s, size_t n)
            "  p99 %7" PRIu64 "  max %8" PRIu64 "  mean %9.1f  ns\n",
            label, s[0], pct_of(s, n, 50), pct_of(s, n, 90), pct_of(s, n, 99),
            s[n - 1], (double)sum / (double)n);
+    if (n != planned) {
+        printf("  %-12s (NOTE: only %zu of %zu planned samples were collected)\n",
+               label, n, planned);
+    }
 }
 
 /* ---------------------------------------------------------------- */
@@ -99,12 +110,14 @@ static void *echo_thread(void *arg)
 
 int main(int argc, char **argv)
 {
-    uint64_t rounds = 20000;
-    size_t   payload = 256;
-    int      sv[2];
-    char    *buf, *rbuf;
+    uint64_t  rounds = 20000;
+    size_t    payload = 256;
+    int       sv[2];
+    char     *buf, *rbuf;
     uint64_t *same, *two;
-    int      i;
+    size_t    same_n, two_n;
+    int       i;
+    uint64_t  k;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) {
@@ -137,7 +150,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "rt_baseline: socketpair: %s\n", strerror(errno));
         return 1;
     }
-    for (uint64_t k = 0; k < rounds; k++) {
+    for (k = 0; k < rounds; k++) {
         uint64_t t0 = now_ns();
         if (send(sv[0], buf, payload, 0) < 0) {
             fprintf(stderr, "rt_baseline: send: %s\n", strerror(errno));
@@ -149,6 +162,7 @@ int main(int argc, char **argv)
         }
         same[k] = now_ns() - t0;
     }
+    same_n = (size_t)rounds;
     close(sv[0]);
     close(sv[1]);
 
@@ -170,24 +184,31 @@ int main(int argc, char **argv)
          * first round trip is not charged for thread startup. */
         nanosleep(&ts, NULL);
 
-        for (uint64_t k = 0; k < rounds; k++) {
+        for (k = 0; k < rounds; k++) {
             uint64_t t0 = now_ns();
             if (send(sv[0], buf, payload, 0) < 0) {
+                fprintf(stderr, "rt_baseline: two-thread send: %s\n",
+                        strerror(errno));
                 break;
             }
             if (recv(sv[0], rbuf, payload, 0) < 0) {
+                fprintf(stderr, "rt_baseline: two-thread recv: %s\n",
+                        strerror(errno));
                 break;
             }
             two[k] = now_ns() - t0;
         }
+        /* Only the slots actually filled are statistics; the rest are still
+         * zero from calloc() and must not be counted. */
+        two_n = (size_t)k;
         close(sv[0]);
         shutdown(sv[1], SHUT_RDWR);
         pthread_join(t, NULL);
         close(sv[1]);
     }
 
-    report("same-thread", same, (size_t)rounds);
-    report("two-thread", two, (size_t)rounds);
+    report("same-thread", same, same_n, (size_t)rounds);
+    report("two-thread", two, two_n, (size_t)rounds);
 
     free(buf);
     free(rbuf);

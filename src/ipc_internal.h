@@ -62,8 +62,10 @@ struct ipc_ctx {
     int lock_fd;
     int epoll_fd;
     int stop_evfd;
-    int bounds_created; /* socket path was created by us (unlink on teardown)  
-                         * and the lock file was created by us */
+    int bounds_created; /* the socket path was created by us, so teardown
+                         * unlinks it.  Does NOT cover the lock file: that one
+                         * is deliberately never removed (see
+                         * ctx_release_resources()). */
 
     /* config + options */
     ipc_config_t        *cfg;
@@ -75,7 +77,14 @@ struct ipc_ctx {
     void          *handler_user;
     _Atomic int    loop_thread_started;
     _Atomic int    stopped;
-    _Atomic int    teardown; /* ipc_unregister() is running */
+    _Atomic int    teardown;      /* ipc_unregister() was entered          */
+    _Atomic int    teardown_done; /* ipc_unregister() finished; the context
+                                   * is drained and only ipc_ctx_free() is
+                                   * still allowed to touch it            */
+    _Atomic int    loop_error;    /* fatal error that killed the receive
+                                   * loop; 0 while it is healthy.  Reported
+                                   * by ipc_run() so a dead loop cannot look
+                                   * like a normal ipc_stop().             */
     pthread_t      loop_thread;
     int            have_loop_thread;
     pthread_t     *workers;

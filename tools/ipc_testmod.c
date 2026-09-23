@@ -1011,6 +1011,7 @@ int main(int argc, char **argv)
         pthread_join(rt, NULL);
     }
     ipc_unregister(g_ctx);
+    ipc_ctx_free(g_ctx);
     J("EXIT");
     fclose(g_jf);
     return 0;

@@ -162,7 +162,14 @@ mod_ready B2 8 || fail "B2 failed to register"
 # Warm up so one-off allocations are not counted as growth.
 mod_cmd A1 "soak 2000 B2 1400 warmup"
 jwait "$(journal A1)" '^SOAK ' 30 || fail "the warm-up burst did not finish"
-sleep 0.5
+# A1 has *sent* the warm-up burst; wait for B2 to have read all of it before
+# sampling the baseline.  Poll the counter rather than sleeping a fixed time.
+for _ in $(seq 1 40); do
+    mod_stats B2
+    warm="$(jfield "$(journal B2)" '^STATS' recv_read)"
+    [ "${warm:-0}" -ge 2000 ] && break
+    sleep 0.1
+done
 fds_before="$(proc_fds "${MOD_PID[B2]}")"
 rss_before="$(proc_rss_kb "${MOD_PID[B2]}")"
 echo "   before: fds=$fds_before rss=${rss_before}KiB"
@@ -194,7 +201,18 @@ if [ "$drained" -eq 1 ]; then
 else
     fail "the sink only accounted for $(( ${invoked:-0} + ${dropped:-0} )) messages"
 fi
-sleep 0.5
+
+# The drain loop above proved every message was accounted for; the difference
+# now under test is purely "did any descriptor or page stay behind", so wait for
+# the /proc sample to stop moving instead of sleeping a fixed time.  This feeds
+# an assertion, so it must not be a guess.
+prev=""
+for _ in $(seq 1 20); do
+    cur="$(proc_fds "${MOD_PID[B2]}")/$(proc_rss_kb "${MOD_PID[B2]}")"
+    [ "$cur" = "$prev" ] && break
+    prev="$cur"
+    sleep 0.1
+done
 
 fds_after="$(proc_fds "${MOD_PID[B2]}")"
 rss_after="$(proc_rss_kb "${MOD_PID[B2]}")"

@@ -474,6 +474,17 @@ int main(int argc, char **argv)
     if (window == 0 && use_pool) {
         window = (uint64_t)opts.cb_queue_max / 4u;
     }
+    /* An explicit --window above the queue depth would silently push
+     * cb_dropped off zero, which invalidates the "zero loss" reading of the
+     * throughput table.  Clamp loudly instead of reporting a rate that was
+     * bought with dropped events. */
+    if (window > 0 && window > (uint64_t)opts.cb_queue_max) {
+        fprintf(stderr,
+                "bench: --window %" PRIu64 " exceeds the callback queue depth "
+                "(%d); clamping to %d\n",
+                window, opts.cb_queue_max, opts.cb_queue_max);
+        window = (uint64_t)opts.cb_queue_max;
+    }
 
     opts.module = "bench_rx";
     rc = ipc_register(&opts, &rx.ctx);
@@ -645,8 +656,10 @@ out_stop:
     }
 out_unreg_both:
     ipc_unregister(tx.ctx);
+    ipc_ctx_free(tx.ctx);
 out_unreg_rx:
     ipc_unregister(rx.ctx);
+    ipc_ctx_free(rx.ctx);
 out_scratch:
     free(lat_buf);
     if (!keep) {

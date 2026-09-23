@@ -129,6 +129,46 @@ static int resolve_group(const char *name, gid_t *out)
     return IPC_ERR_PERM;
 }
 
+/* Validate the configuration file itself.
+ *
+ * The config is the trust root: it decides which UID may occupy which socket
+ * path.  A service that can write it can register itself as any module it
+ * likes, so a group- or world-writable config (or one owned by an unrelated
+ * UID) is refused at registration.
+ *
+ * This is a different object from the one check_own_dir() guards: that one
+ * covers the socket *directory*.  Both are needed.
+ *
+ * The stat() and the later read are not one atomic operation; the ownership
+ * and mode check still closes the realistic case (a config the service itself
+ * can modify), and the remaining window requires an attacker who can already
+ * replace files in the config's directory. */
+static int check_config_file(const char *path)
+{
+    struct stat st;
+    uid_t       me = geteuid();
+
+    if (stat(path, &st) != 0) {
+        IPC_LOGE("config %s: %s", path, strerror(errno));
+        return errno == ENOENT ? IPC_ERR_NOENT : ipc_errno_to_rc(errno);
+    }
+    if (!S_ISREG(st.st_mode)) {
+        IPC_LOGE("refusing config %s: not a regular file", path);
+        return IPC_ERR_PERM;
+    }
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+        IPC_LOGE("refusing config %s: mode %04o is writable by group or others",
+                 path, (unsigned)(st.st_mode & 07777));
+        return IPC_ERR_PERM;
+    }
+    if (st.st_uid != 0 && st.st_uid != me) {
+        IPC_LOGE("refusing config %s: owned by uid %u, which is neither root "
+                 "nor ours (%u)", path, (unsigned)st.st_uid, (unsigned)me);
+        return IPC_ERR_PERM;
+    }
+    return IPC_OK;
+}
+
 /* ------------------------------------------------------------------ */
 /* misc accessors                                                      */
 /* ------------------------------------------------------------------ */
@@ -357,6 +397,10 @@ int ipc_register(const ipc_register_opts_t *opts, ipc_ctx_t **out)
 
     /* ---- static module table -------------------------------------- */
     conf_path = ctx->opt.conf_path ? ctx->opt.conf_path : IPC_CONF_DEFAULT;
+    rc        = check_config_file(conf_path);
+    if (rc != IPC_OK) {
+        goto fail;
+    }
     rc        = ipc_config_load(conf_path, &ctx->cfg);
     if (rc != IPC_OK) {
         goto fail;
@@ -610,13 +654,34 @@ int ipc_unregister(ipc_ctx_t *ctx)
     if (ctx == NULL) {
         return IPC_ERR_INVAL;
     }
-    if (atomic_exchange(&ctx->teardown, 1)) {
-        return IPC_OK; /* already tearing down / torn down: idempotent */
-    }
     if (ctx->fd >= 0 && getpid() != ctx->owner_pid) {
-        /* A forked child must not tear the parent's context down. */
+        /* A forked child must not tear the parent's context down.  Checked
+         * before anything is claimed so it cannot leave the context looking
+         * half-torn-down. */
         return IPC_ERR_STATE;
     }
+
+    /* Idempotent *and* safe to call concurrently.
+     *
+     * Exactly one caller performs the teardown; every other caller waits until
+     * it has finished and then returns IPC_OK.  Waiting rather than returning
+     * early is what makes the documented meaning of this function -- "on
+     * return, the resources are released" -- true for the second caller too.
+     *
+     * The context is NOT freed here.  Freeing it would turn a second call
+     * (or any accessor: ipc_get_stats, ipc_module_id, ...) into a
+     * use-after-free, and the teardown flag cannot protect an object that no
+     * longer exists.  The allocation is released by ipc_ctx_free(). */
+    pthread_mutex_lock(&ctx->life_lock);
+    if (atomic_load(&ctx->teardown)) {
+        while (!atomic_load(&ctx->teardown_done)) {
+            pthread_cond_wait(&ctx->life_cv, &ctx->life_lock);
+        }
+        pthread_mutex_unlock(&ctx->life_lock);
+        return IPC_OK;
+    }
+    atomic_store(&ctx->teardown, 1);
+    pthread_mutex_unlock(&ctx->life_lock);
 
     /* 1. stop taking part in the protocol */
     ipc_stop(ctx);
@@ -649,16 +714,39 @@ int ipc_unregister(ipc_ctx_t *ctx)
     rc = IPC_OK;
     ctx_release_resources(ctx, ctx->bounds_created);
 
-    /* 6. the lock is now released; destroy the rest */
+    /* 6. the lock is now released; destroy the rest of the payload */
     ipc_pending_destroy(&ctx->pend);
     ipc_queue_destroy(&ctx->queue);
-    pthread_cond_destroy(&ctx->life_cv);
-    pthread_mutex_destroy(&ctx->life_lock);
     if (ctx->cfg != NULL) {
         ipc_config_free(ctx->cfg);
         ctx->cfg = NULL;
     }
     IPC_LOGI("module %s/%s unregistered", ctx->ns, ctx->module);
-    free(ctx);
+
+    /* Publish "teardown complete" while the condition variable still exists,
+     * so a concurrent second caller can return.  The mutex and the condition
+     * variable outlive this call on purpose: destroying them here would race
+     * with a waiter that has been woken but has not re-acquired the mutex yet.
+     * ipc_ctx_free() destroys them once nobody can be waiting any more. */
+    pthread_mutex_lock(&ctx->life_lock);
+    atomic_store(&ctx->teardown_done, 1);
+    pthread_cond_broadcast(&ctx->life_cv);
+    pthread_mutex_unlock(&ctx->life_lock);
     return rc;
+}
+
+int ipc_ctx_free(ipc_ctx_t *ctx)
+{
+    if (ctx == NULL) {
+        return IPC_ERR_INVAL;
+    }
+    if (!atomic_load(&ctx->teardown_done)) {
+        IPC_LOGE("ipc_ctx_free() before ipc_unregister() completed; refusing to "
+                 "free a live context");
+        return IPC_ERR_STATE;
+    }
+    pthread_cond_destroy(&ctx->life_cv);
+    pthread_mutex_destroy(&ctx->life_lock);
+    free(ctx);
+    return IPC_OK;
 }

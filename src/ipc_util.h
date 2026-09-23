@@ -29,7 +29,10 @@ void ipc_logf(ipc_log_level_t lvl, const char *fmt, ...)
 #define IPC_LOGI(...) ipc_logf(IPC_LOG_INFO, __VA_ARGS__)
 #define IPC_LOGD(...) ipc_logf(IPC_LOG_DEBUG, __VA_ARGS__)
 
-/* Map a failing-errno value to the library error space.  Never returns 0. */
+/* Map a failing-errno value to the library error space.
+ * ipc_errno_to_rc(0) == IPC_OK, which is deliberately allowed so that
+ * `rc = ipc_errno_to_rc(errno)` is safe on a success path too.  Every
+ * non-zero errno maps to a negative ipc_err_t. */
 int ipc_errno_to_rc(int err);
 
 /* Bounded copy; always NUL terminates.  Returns the source length. */
@@ -50,7 +53,12 @@ uint64_t ipc_mix64(uint64_t x);
 uint64_t ipc_gen_instance_id(void);
 
 /* Read the whole of `path` into a malloc'd NUL-terminated buffer.
+ *
+ * `initial_cap` is only the first allocation hint: the buffer grows as needed
+ * and there is NO upper bound on the returned length.  (It used to be called
+ * `max_bytes`, which read like a limit it never enforced.)
+ *
  * *out_err receives an ipc_err_t on failure. */
-char *ipc_read_file(const char *path, size_t max_bytes, int *out_err);
+char *ipc_read_file(const char *path, size_t initial_cap, int *out_err);
 
 #endif /* IPC_UTIL_H */

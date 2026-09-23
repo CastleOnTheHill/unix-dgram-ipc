@@ -11,6 +11,11 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB="${IPC_LAB:-/opt/ipc-lab}"
+# `rm -rf "$LAB"` as root is the single most destructive line in the repository,
+# so the guard runs before anything else.
+# shellcheck source=lab_guard.sh
+. "$HERE/lab_guard.sh"
+guard_lab_path "$LAB" || exit 1
 KEEP_USERS=0
 [ "${1:-}" = "--keep-users" ] && KEEP_USERS=1
 

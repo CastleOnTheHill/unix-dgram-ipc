@@ -24,8 +24,9 @@ typedef struct {
     void    *reply_buf;      /* caller-owned */
     size_t   reply_cap;
     uint64_t req_id;
-    uint64_t deadline_ns;    /* absolute CLOCK_MONOTONIC ns; 0 == no deadline */
-    pid_t    owner_pid;      /* only the creating thread may wait on it */
+    uint64_t deadline_ns;    /* absolute CLOCK_MONOTONIC ns; 0 == no deadline.
+                              * The condition variable is created with
+                              * CLOCK_MONOTONIC so this is used verbatim. */
     char     dst[IPC_NAME_MAX];
 } ipc_pending_slot_t;
 

@@ -40,7 +40,8 @@ is what the rewrite is checked against. Its numbers and its API names
 | Compilation | **0 warnings** across 31 translation units at `-Wall -Wextra -Wpedantic -Werror -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith -Wcast-align -Wformat -Wformat-security -Wundef -Wvla -Wredundant-decls -Wswitch-enum -Winit-self`, plus all 10 headers compiling standalone |
 | Linking | **succeeds**; every `Ipc*` symbol referenced by the tests resolves inside `libipc.a` |
 | Deliverable separation | **verified mechanically** — no `IpcRefHost*` / `utest` / `main` symbols in `libipc.a`; every function declared in `include/ipc/ipc.h` has a definition |
-| Shell syntax of the test harness | **verified** (`bash -n` over all 11 scripts, with a known-broken control that is correctly rejected) |
+| Shell syntax of the test harness | **verified** (`bash -n` over all 12 scripts, with a known-broken control that is correctly rejected) |
+| Makefile structure | **verified** (`scripts/mkcheck.py`: recipe indentation, `.PHONY` ghosts, recursive `$(MAKE)` targets, and every `make <target>` named by a script or by a doc code block — each check backed by a control group) |
 | Unit tests | **never executed** |
 | Integration tests | **never executed** |
 | Coverage | **not measured** |
@@ -57,11 +58,25 @@ would exercise none of the properties this project is about, while producing
 output that looks like a verdict.
 
 So: **the sentences "tests pass" and "coverage meets the 80% bar" are not
-authorised yet.** See §6 for the commands that would produce them.
+authorised yet.** `scripts/wsl-verify.sh` is the one command that produces them
+(once `wsl.exe` is unblocked):
+
+```bash
+wsl.exe -d Ubuntu-22.04 -u root -- \
+    bash /mnt/d/code/unix_odmain_ipc/scripts/wsl-verify.sh
+```
+
+It mirrors the tree to a Linux-native filesystem, runs build → separation →
+unit → integration → coverage → ASan, and writes a `VERDICT.txt` where every
+step is `PASS`, `FAIL` or `BLOCKED` — **"did not run" is never reported as
+`PASS`**. Note that the `## 6. Build and run` section below belongs to the
+frozen prototype and lists *its* commands, not the rewrite's.
 
 ---
 
 # Appendix — the frozen prototype's contract
+
+<!-- mkcheck: skip-rest — everything below is legacy-prototype, not main. -->
 
 *The remainder of this document describes `legacy-prototype` /
 [`REPORT.md`](REPORT.md). Kept for reference; not the current contract.*

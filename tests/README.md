@@ -124,7 +124,7 @@ make BUILD=build-asan OPT='-O1 -g -fsanitize=address,undefined' test
 
 ## 六、⚠ 当前状态：这套测试**从未被执行过**
 
-截至 2026-09-23：
+截至 2026-09-24：
 
 - 单元测试与集成测试的源码**全部写完**，并且在 `-Werror` 下 **0 警告**通过
   编译、链接成功（用 ziglang 交叉编译到 `x86_64-linux-gnu` 验证的）；
@@ -134,14 +134,33 @@ make BUILD=build-asan OPT='-O1 -g -fsanitize=address,undefined' test
   不许把「编译通过」当成「测试通过」，也不许把「设计上应该覆盖了」
   当成覆盖率数字。
 
-要拿到真实结论，需要先在 Linux 原生文件系统上跑：
+要拿到真实结论，需要在 Linux 原生文件系统上跑。一条命令（需先在安全中心
+放行 `wsl.exe`）：
+
+```bash
+wsl.exe -d Ubuntu-22.04 -u root -- \
+    bash /mnt/d/code/unix_odmain_ipc/scripts/wsl-verify.sh
+```
+
+它会先把源码镜像到 Linux 原生 FS，再依次跑
+构建 → 交付物分离性 → 门槛自检 → 单元 → 集成 → 覆盖率 → ASan，
+每一步判成 `PASS` / `FAIL` / `BLOCKED` 写进 `VERDICT.txt` ——
+**「没跑」不许写成 `PASS`**，任何一步 BLOCKED 都不算通过。
+
+想手工分步跑：
 
 ```bash
 make test                                  # 0 警告 + 单元 + 集成
 make coverage                              # 真实行覆盖率（门槛 80%，lcov）
-make checkout-separation                   # 交付物分离性
+make check-separation                      # 交付物分离性
 BUILD=build-asan IPC_LAB=/opt/ipc-lab-asan \
     OPT='-O1 -g -fsanitize=address,undefined' make test
 ```
 
 在此之前，任何报告里的「测试通过」都必须带着这条限制一起写。
+
+> 本机没有 C 工具链时，`make dev-check` 会跑一组**只做静态判定**的降级
+> 检查（用 ziglang 交叉编译 → 编译/链接/符号表/shell 语法/Makefile 结构），
+> 每个都带能报脏的对照组。它给不出「测试通过」「覆盖率达标」——
+> 那两句必须真的跑起来才有，两者不能互相替代。其中 Makefile 那一项是
+> `scripts/mkcheck.py`（只依赖 Python 3 标准库），任何 clone 下来都能跑。

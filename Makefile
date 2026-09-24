@@ -63,7 +63,7 @@ SUPPORT_OBJ := $(patsubst tests/support/%.c,$(BUILD)/obj/support/%.o,$(SUPPORT_S
 UNIT_OBJ    := $(patsubst tests/unit/%.c,$(BUILD)/obj/unit/%.o,$(UNIT_SRC))
 
 .PHONY: all lib test unit integration tools bench coverage cov-threshold \
-        coverage-selftest check-separation dev-check clean help
+        coverage-selftest check-separation dev-check clean clean-all help
 
 all: lib
 
@@ -76,13 +76,15 @@ help:
 	@echo "make coverage-selftest —— 证明覆盖率门槛真的会判不达标"
 	@echo "make check-separation  —— 证明 libipc.a 里没有测试用实现"
 	@echo "make dev-check         —— 【没有 C 工具链时的降级检查】见下"
-	@echo "make clean             —— 删掉 \$$(BUILD)"
+	@echo "make clean             —— 删掉 \$$(BUILD)（只删当前这棵配置的树）"
+	@echo "make clean-all         —— 三棵树全删：build / build-asan / build-cov"
 	@echo ""
 	@echo "ASan 那一遍请换个树：make BUILD=build-asan OPT='-O1 -g -fsanitize=address,undefined' test"
 	@echo ""
-	@echo "关于 dev-check：它走的是 .workbuddy/checks/ 下的降级脚本，只在"
-	@echo "「这台机器上装不了/用不了 C 工具链」时才用。它用 ziglang 做交叉编译，"
-	@echo "能给的是**编译、链接、符号表、shell 语法**四类结论；"
+	@echo "关于 dev-check：它走 .workbuddy/checks/ 下的降级脚本，外加"
+	@echo "scripts/mkcheck.py，只在「这台机器上装不了/用不了 C 工具链」时才用。"
+	@echo "它用 ziglang 做交叉编译，能给的是**编译、链接、符号表、shell 语法、"
+	@echo "Makefile 结构**五类结论；"
 	@echo "它给不出「测试通过」和「覆盖率达标」—— 那两句必须真的跑起来才有。"
 	@echo "能正常 make test 的时候不要用它，两者不能互相替代。"
 
@@ -92,9 +94,15 @@ help:
 # 使用前提：.workbuddy/ 目录存在（它不进仓库）。所以这个目标**不在**任何
 # 默认路径上，只能显式调；缺脚本时明确报错退出，不静默跳过。
 #
-# 它自己的对照组用 `bash .workbuddy/checks/zcc.sh --control` 与
-# `python .workbuddy/checks/symcheck.py --control` 跑 —— 这两条也必须过，
+# 它自己的对照组用 `bash .workbuddy/checks/zcc.sh --control`、
+# `python3 .workbuddy/checks/symcheck.py --control`、
+# `python3 .workbuddy/checks/mkcheck.py --control` 跑 —— 这三条也必须过，
 # 否则「检查通过」没有意义。
+#
+# mkcheck 是查**这个 Makefile 自己**的（本机没有 make，改完 Makefile 没法
+# 真跑一遍）：recipe 缩进、.PHONY 里的幽灵目标、递归 $(MAKE) 的目标名，
+# 以及 scripts/ 里调用的目标名是否存在。它只依赖 Python 3 标准库，所以
+# 放在 scripts/ 里（进仓库），不在 .workbuddy/checks/ 下。
 # ---------------------------------------------------------------------
 
 dev-check:
@@ -105,6 +113,9 @@ dev-check:
 	@echo "== 降级检查的对照组（先证明检查器能报脏）"
 	@bash .workbuddy/checks/zcc.sh --control || exit 1
 	@python3 .workbuddy/checks/symcheck.py --control || exit 1
+	@python3 scripts/mkcheck.py --control || exit 1
+	@echo ""
+	@python3 scripts/mkcheck.py
 	@echo ""
 	@bash .workbuddy/checks/zcc.sh
 
@@ -286,8 +297,18 @@ coverage-selftest:
 
 # ---------------------------------------------------------------------
 # 清理
+#
+# 【2026-09-24 修复】原先 `clean` 是 `rm -rf $(BUILD)` 外加一条**无条件**的
+# `rm -rf build-cov`。BUILD 是可配置的，于是 `make BUILD=build-asan clean`
+# 会顺手把覆盖率那棵树也删掉 —— 这正是 wsl-verify 流水线的顺序
+# （先 coverage，后 asan），结果上一步刚跑出来的数据和 HTML 报告被下一步
+# 静默清零。现在拆成两个：
+#     clean      只删当前 $(BUILD)（符合「clean 只管本配置」的惯例）
+#     clean-all  三棵树全删（想彻底重来时用）
 # ---------------------------------------------------------------------
 
 clean:
 	rm -rf $(BUILD)
-	rm -rf build-cov
+
+clean-all:
+	rm -rf build build-asan build-cov

@@ -137,8 +137,16 @@ UTEST_CASE(lifecycle, register_argument_checks)
     UTEST_ASSERT_EQ(IpcRegister(&options, &ctx), IPC_ERR_INVAL);
     UTEST_ASSERT_NULL(ctx);
 
-    /* 超长（32 字符，字段只有 31 字符 + NUL）。 */
-    options.moduleId = "module-name-that-is-exactly32ch";
+    /*
+     * 超长（32 字符，字段只有 31 字符 + NUL）。
+     *
+     * 这里**先断言字面量长度**，再断言返回值。原因：原版注释写「32 字符」，
+     * 而字面量实际只有 31 —— 正好卡在上限内，于是这条用例一直在测「一个
+     * 合法 moduleId 会被配置查找拒掉」，得到 NOENT 而不是 INVAL。
+     * 长度靠肉眼数会再错一次，所以让机器数。
+     */
+    options.moduleId = "module-name-that-is-exactly-32ch";
+    UTEST_ASSERT_EQ(strlen(options.moduleId), (size_t)32);
     UTEST_ASSERT_EQ(IpcRegister(&options, &ctx), IPC_ERR_INVAL);
     UTEST_ASSERT_NULL(ctx);
     IpcLabCaptureEnd();
@@ -184,15 +192,24 @@ UTEST_CASE(lifecycle, register_rejects_ambiguous_namespace)
     TestLab          lab;
     IpcModuleOptions options = IPC_MODULE_OPTIONS_INIT;
     IpcContext      *ctx     = NULL;
-    char             text[1024];
+    /*
+     * text 必须放得下**最坏情况**：pathA/pathB 由 IpcLabSockPath 填入，各自
+     * 最多 sizeof-1 = 511 字节，格式串固定部分 20 字节 ⇒ 上限 1063 字节。
+     * 取小了不会在运行期暴露任何症状，而是被 GCC 在 -O2 下用
+     * -Werror=format-truncation 拦下（单元测试确实因此从未编译过）。
+     */
+    char             text[1200];
     char             pathA[512];
     char             pathB[512];
+    int              written;
 
     UTEST_ASSERT_EQ(LabSetup(&lab, "alpha", "beta"), 0);
     IpcLabSockPath(lab.dir, "dupA", pathA, sizeof(pathA));
     IpcLabSockPath(lab.dir, "dupB", pathB, sizeof(pathB));
-    (void)snprintf(text, sizeof(text), "nsA dup %lu %s\nnsB dup %lu %s\n",
-                   (unsigned long)getuid(), pathA, (unsigned long)getuid(), pathB);
+    written = snprintf(text, sizeof(text), "nsA dup %lu %s\nnsB dup %lu %s\n",
+                       (unsigned long)getuid(), pathA, (unsigned long)getuid(), pathB);
+    /* 真被截断了，测的就不是本来想测的那张配置表了 —— 显式失败，别静默。 */
+    UTEST_ASSERT(written > 0 && (size_t)written < sizeof(text));
     UTEST_ASSERT_EQ(LabWriteRawConf(&lab, text), 0);
 
     options.moduleId = "dup";
@@ -218,14 +235,17 @@ UTEST_CASE(lifecycle, register_rejects_uid_mismatch)
     TestLab          lab;
     IpcModuleOptions options = IPC_MODULE_OPTIONS_INIT;
     IpcContext      *ctx     = NULL;
-    char             text[512];
+    /* 同上：path 最多 511 字节，格式串固定部分 20 字节 ⇒ 上限 540。 */
+    char             text[1024];
     char             path[512];
+    int              written;
     uid_t            someoneElse = (uid_t)(getuid() + 1000);
 
     UTEST_ASSERT_EQ(LabSetup(&lab, "alpha", "beta"), 0);
     IpcLabSockPath(lab.dir, "stranger", path, sizeof(path));
-    (void)snprintf(text, sizeof(text), "%s stranger %lu %s\n", LAB_NS,
-                   (unsigned long)someoneElse, path);
+    written = snprintf(text, sizeof(text), "%s stranger %lu %s\n", LAB_NS,
+                       (unsigned long)someoneElse, path);
+    UTEST_ASSERT(written > 0 && (size_t)written < sizeof(text));
     UTEST_ASSERT_EQ(LabWriteRawConf(&lab, text), 0);
 
     /*

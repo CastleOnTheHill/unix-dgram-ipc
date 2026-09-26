@@ -295,6 +295,44 @@ UTEST_CASE(log, ctx_own_level_overrides_global)
     RestoreDefaults();
 }
 
+UTEST_CASE(log, ctx_illegal_level_falls_back_to_global)
+{
+    /*
+     * 模块级 logLevel 越界的消毒回归：一个 7（大于 ERROR）若被直接当成
+     * 有效级别，`ERROR(4) < 7` 会连最严重的日志都吞掉 —— 「把级别调高」
+     * 反而让 ERROR 消失，失效方向不安全。越界必须视同「没填」（沿用全局），
+     * 与 IpcSetLogLevel 对非法值的处理一致。
+     */
+    IpcContext ctx;
+
+    RestoreDefaults();
+    ResetCapture();
+    IpcSetLogFunc(CaptureLog, NULL);
+    InitFakeContext(&ctx, "modG");
+
+    /* 全局开到 DEBUG（放行一切），模块级填一个越界值：不能吞日志。 */
+    IpcSetLogLevel(IPC_LOG_DEBUG);
+    ctx.logLevel = 7;
+    IpcLogEmit(&ctx, IPC_LOG_ERROR, "error must not be swallowed");
+    UTEST_ASSERT_EQ(g_calls, 1);
+
+    /* 负数同理。 */
+    ctx.logLevel = -2;
+    IpcLogEmit(&ctx, IPC_LOG_WARN, "warn passes too");
+    UTEST_ASSERT_EQ(g_calls, 2);
+
+    /* 对照：合法的模块级值仍然覆盖全局 —— 证明上面两条不是
+     * 「全局本来就放行」的巧合，而是越界值真的退回了全局语义。 */
+    ResetCapture();
+    ctx.logLevel = IPC_LOG_ERROR;
+    IpcLogEmit(&ctx, IPC_LOG_WARN, "filtered by a valid module level");
+    UTEST_ASSERT_EQ(g_calls, 0);
+    IpcLogEmit(&ctx, IPC_LOG_ERROR, "valid module level passes");
+    UTEST_ASSERT_EQ(g_calls, 1);
+
+    RestoreDefaults();
+}
+
 UTEST_CASE(log, ctx_variants_are_safe)
 {
     IpcContext ctx;

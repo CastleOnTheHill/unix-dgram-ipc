@@ -73,9 +73,16 @@ fi
 TCheck "第一个 beta 仍在运行" kill -0 "$PID_B1"
 
 # ---- 而且赢家还能正常干活 ----
+#
+# 载荷放进变量、**长度由变量算出来**：原来这条断言把载荷写成字面量、长度
+# 也写成字面量 11，而 "stillalive" 只有 10 字节，于是它永远匹配不上（实际
+# journal 里是 `RECV alpha 7 10 stillalive`）。长度靠肉眼数会数错，所以
+# 让它由 ${#PAYLOAD} 生成 —— 这样两者不可能再对不上。
+PAYLOAD="stillalive"
+
 : >"$JournalA"
 {
-    printf 'post beta 7 stillalive\n'
+    printf 'post beta 7 %s\n' "$PAYLOAD"
     printf 'stop\n'
 } >"$LAB/a.script"
 
@@ -84,7 +91,7 @@ StartMod "$JournalA" "$LAB" alpha --conf "$ConfPath" --module alpha \
 PID_A="$LAST_PID"
 JWait "$JournalA" '^DONE ' 4000 || TFail "alpha 没能结束"
 TCheck "alpha 发送成功" grep -qE '^SEND beta ok$' "$JournalA"
-JWait "$JournalB" '^RECV alpha 7 11 stillalive$' 2000 \
+JWait "$JournalB" "^RECV alpha 7 ${#PAYLOAD} $PAYLOAD\$" 2000 \
     || TFail "赢家没能收到注册竞争期间发来的报文"
 
 StopMod "$PID_A"

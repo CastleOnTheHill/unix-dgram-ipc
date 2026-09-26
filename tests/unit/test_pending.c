@@ -517,11 +517,28 @@ UTEST_CASE(pending, waiter_is_woken_by_abort)
     IpcPendingDestroy(&pending);
 }
 
+/* 延迟释放槽位的辅助线程，用来证明 WaitDrained 确实在等释放。 */
+typedef struct {
+    IpcPending *pending;
+    int32_t     index;
+} ReleaseArgs;
+
+static void *ReleaseAfterDelay(void *arg)
+{
+    ReleaseArgs *args = (ReleaseArgs *)arg;
+
+    SleepMs(30);
+    IpcPendingRelease(args->pending, args->index);
+    return NULL;
+}
+
 UTEST_CASE(pending, wait_drained_returns_after_all_slots_released)
 {
-    IpcPending pending;
-    int32_t    index = -1;
-    uint64_t   reqId = 0;
+    IpcPending  pending;
+    ReleaseArgs args;
+    pthread_t   thread;
+    int32_t     index = -1;
+    uint64_t    reqId = 0;
 
     UTEST_ASSERT_EQ(IpcPendingInit(&pending, 4, NULL), IPC_OK);
     UTEST_ASSERT_EQ(IpcPendingAdd(&pending, "peer", TEST_INSTANCE, -1, NULL, 0, &index,
@@ -529,13 +546,32 @@ UTEST_CASE(pending, wait_drained_returns_after_all_slots_released)
                     IPC_OK);
     UTEST_ASSERT_EQ(pending.liveSlots, 1);
 
-    /* 都不放了：排空应当立刻返回，不能被卡住。
-     * （IpcUnregister 用的正是「先 WakeAll 再 WaitDrained」这个顺序，
-     *   而这里连 WakeAll 都不需要 —— 没有人在等。） */
-    IpcPendingWaitDrained(&pending);
+    /*
+     * 契约（见 ipc_pending.h）是「阻塞直到所有槽位都被释放」，并且明写
+     * 「前提是 abortFlag 已经被置位，否则等待者永远不会退出」。
+     *
+     * 这条用例原来写的是「加一个槽位、谁也不释放，然后断言排空立刻返回」——
+     * 与契约正好相反。结果是它无限期挂在 condvar 上（进程单线程、futex 无
+     * 超时参数），把整个套件拖成「看起来还在跑」，覆盖率/ASan 两步连带跑不到。
+     * 那不是库的问题，是用例的假设错了。
+     *
+     * 真正值得钉的性质是「**释放之后**才返回」，所以让另一个线程延迟释放，
+     * 再断言返回那一刻槽位已经是空的 —— 如果它提前返回，这里读到的是 1。
+     * （残留竞态：主线程要恰好被调度推迟 30 ms 才会让释放先发生；概率极低，
+     *   且即使发生也只会漏检，不会误报。）
+     */
+    args.pending = &pending;
+    args.index   = index;
+    UTEST_ASSERT_EQ(pthread_create(&thread, NULL, ReleaseAfterDelay, &args), 0);
 
-    IpcPendingRelease(&pending, index);
+    IpcPendingWaitDrained(&pending);
+    UTEST_ASSERT_EQ(pending.liveSlots, 0); /* 返回时就必须空了 */
+    UTEST_ASSERT_EQ(pthread_join(thread, NULL), 0);
+    UTEST_ASSERT_EQ(pending.liveSlots, 0);
+
+    /* 已经排空：再调一次必须立刻返回（不空转的回归保护）。 */
     IpcPendingWaitDrained(&pending);
     UTEST_ASSERT_EQ(pending.liveSlots, 0);
+
     IpcPendingDestroy(&pending);
 }

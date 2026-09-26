@@ -277,9 +277,32 @@ char *IpcReadFile(const char *path, size_t maxBytes, int32_t *outErr)
 
         if (len == cap) {
             char  *grown;
-            size_t newCap = cap * 2;
+            size_t newCap;
 
             if (cap >= maxBytes) {
+                /*
+                 * 已经用满允许的上限。**必须再探一个字节**才能判「超限」：
+                 * 直接报 MSGSIZE 会把「文件恰好等于上限」误判成超限 ——
+                 * 白盒单测正好钉着这条边界（读 16 字节失败、读正好等于
+                 * 文件大小必须成功）。
+                 */
+                char    probe;
+                ssize_t extra = read(fd, &probe, 1);
+
+                if (extra < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (extra < 0) {
+                    free(buf);
+                    (void)close(fd);
+                    if (outErr != NULL) {
+                        *outErr = IpcErrnoToResult(errno);
+                    }
+                    return NULL;
+                }
+                if (extra == 0) {
+                    break; /* 正好等于上限：合法，按成功返回 */
+                }
                 free(buf);
                 (void)close(fd);
                 if (outErr != NULL) {
@@ -287,6 +310,7 @@ char *IpcReadFile(const char *path, size_t maxBytes, int32_t *outErr)
                 }
                 return NULL;
             }
+            newCap = cap * 2; /* 指数增长，但不超过调用方给的上限 */
             if (newCap > maxBytes) {
                 newCap = maxBytes;
             }

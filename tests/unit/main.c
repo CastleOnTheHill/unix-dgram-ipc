@@ -22,6 +22,15 @@ int main(int argc, char *argv[])
     const char *filter = NULL;
     int32_t     failed;
 
+    /*
+     * 行缓冲。默认「重定向到文件时用块缓冲」会让一次崩溃丢掉最后几 KB ——
+     * 实测踩过：某个用例里断言失败后没有中止，接着对 NULL 解引用导致段错误，
+     * 于是崩溃前那行「[NN/MM] suite.name ...」还在缓冲区里没落盘，
+     * 崩溃点**无法归因**（日志停在别处，看起来像别的用例崩的）。
+     * 改成行缓冲后，崩在哪个用例上一定看得见。
+     */
+    (void)setvbuf(stdout, NULL, _IOLBF, 0);
+
     if (argc > 1 && argv[1][0] != '\0') {
         filter = argv[1];
     }

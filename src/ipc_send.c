@@ -34,10 +34,20 @@ int32_t IpcPost(IpcContext *ctx, const char *dstModuleId, uint32_t event,
         return rc;
     }
     if (len > (size_t)ctx->maxPayload) {
-        /* 在发送动作之前就拒绝：不构造报文、不碰内核。 */
+        /* 在发送动作之前就拒绝：不构造报文、不碰内核，也不计「尝试」。 */
         IPC_STAT_INC(ctx, sendFailed);
         return IPC_ERR_MSGSIZE;
     }
+
+    /*
+     * 参数与尺寸都过了，从这里开始就算「尝试过一次发送」—— **包括目标不在
+     * 配置表里（NOENT）**：调用方视角这确实是一次失败的发送尝试，与 OFFLINE
+     * 口径一致。
+     * 早先这一条挂在 peer 解析之后，于是 NOENT 只计 sendFailed 不计
+     * sendAttempts —— 表现是「sendFailed 比 sendAttempts 还大」这种不可能
+     * 出现的组合，两个计数器也就失去了互相校验的意义。
+     */
+    IPC_STAT_INC(ctx, sendAttempts);
 
     peer = IpcPeerEntry(ctx, dstModuleId);
     if (peer == NULL) {
@@ -47,7 +57,6 @@ int32_t IpcPost(IpcContext *ctx, const char *dstModuleId, uint32_t event,
 
     IpcIoFillHeader(ctx, &header, (uint8_t)IPC_MSG_TYPE_POST, dstModuleId, event,
                     (uint32_t)len, 0);
-    IPC_STAT_INC(ctx, sendAttempts);
     rc = IpcIoSendTo(ctx, peer->path, &header, data, len);
     if (rc == IPC_OK) {
         IPC_STAT_INC(ctx, sendEnqueued);
@@ -98,12 +107,18 @@ int32_t IpcSendInternal(IpcContext *ctx, const char *dstModuleId, uint32_t event
      * 死锁检测。必须放在最前面（早于任何真实动作），因为它的意义就是
      * 「提前拒绝」而不是「撞上去再报错」。
      *
-     * 判定依据是线程局部标记：本线程正在跑宿主的 dispatch 调用。只有
-     * 「dispatch 内联执行回调」的宿主会命中；投线程池的宿主不会（dispatch
-     * 在回调执行前就已经返回了）。见 ipc_internal.h 里 IpcTlsDispatchContext
-     * 的说明。
+     * 判定依据是线程局部标记：本线程正在跑**某个**上下文的 dispatch 调用。
+     * 注意这里刻意不做 `== ctx` 的同上下文限定 —— 老系统的形态是**一条**
+     * select 线程服务所有上下文（ipc.h §二），在 ctx A 的内联 dispatch 里
+     * 对 ctx B 做同步发送，回复同样要靠这条（此刻正卡在回调里的）线程
+     * 读回来，和同 ctx 的情形是同一种死锁。见 ipc_internal.h 里
+     * IpcTlsDispatchContext 的说明。
+     *
+     * 误拦面（如实写明）：若某个宿主给**每个**上下文各配一条 select 线程，
+     * 跨上下文的 IpcSend 会被本检查误拒。但那不是本库的目标形态，而且
+     * 误拒的后果是拿到一个明确的错误码，不是挂死。
      */
-    if (IpcTlsDispatchContext == ctx) {
+    if (IpcTlsDispatchContext != NULL) {
         IPC_STAT_INC(ctx, deadlockProbes);
         IPC_LOGW(ctx,
                  "IpcSend() called from inside a dispatch callback on the same "

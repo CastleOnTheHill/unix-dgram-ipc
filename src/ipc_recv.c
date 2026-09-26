@@ -253,6 +253,7 @@ static int32_t HandleOneDatagram(IpcContext *ctx, ssize_t received)
 int32_t IpcHandleReadable(IpcContext *ctx, int32_t maxCount)
 {
     int32_t processed = 0;
+    int32_t reads     = 0;
 
     if (ctx == NULL) {
         return IPC_ERR_INVAL;
@@ -296,10 +297,17 @@ int32_t IpcHandleReadable(IpcContext *ctx, int32_t maxCount)
         /* 把 msg_flags 抄出来：HandleOneDatagram 里要用，而下一次循环就会清掉。 */
         ctx->recvMsgFlags = ctx->recvMsg.msg_flags;
 
+        reads++;
         processed += HandleOneDatagram(ctx, received);
 
-        if (maxCount > 0 && processed >= maxCount) {
-            break; /* 返回值 == maxCount 时，宿主可以据此判断可能还有剩余 */
+        /*
+         * 上限按**读取次数**算，不按交付条数算：被校验丢弃的报文同样
+         * 消耗 select 线程的时间。若只数交付，对端灌一段全垃圾的报文
+         * 就能让 processed 恒为 0、上限永不命中，select 线程被钉死在
+         * 本函数里，宿主其余的 fd 全部饿死。
+         */
+        if (maxCount > 0 && reads >= maxCount) {
+            break; /* 上限到了：返回值是交付数，可能小于 maxCount */
         }
     }
     return processed;

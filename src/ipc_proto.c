@@ -223,6 +223,17 @@ int32_t IpcProtoCredFromMsg(struct msghdr *msg, int32_t msgFlags, IpcCred *out)
     }
 
     for (cmsg = CMSG_FIRSTHDR(msg); cmsg != NULL; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+        if (cmsg->cmsg_len == 0) {
+            /*
+             * 全零的控制缓冲：调用方给了空间，但里面一个字都没填。
+             * 这是「**没有**凭据」，不是「报文格式非法」—— 两者对调用方的
+             * 含义不同（前者是缺失、可能重试；后者是对端不老实或内存被踩），
+             * 所以不能都揉成 PROTO。零长度也说明后面不可能再有有效条目，
+             * 直接结束遍历，落到末尾的 !found 分支报 CRED。
+             * 注意区分：cmsg_len **非零**但小于 cmsghdr 才是自相矛盾 → PROTO。
+             */
+            break;
+        }
         if (cmsg->cmsg_len < sizeof(struct cmsghdr)) {
             return IPC_ERR_PROTO; /* cmsg_len 自相矛盾：停手，不再往下解析 */
         }

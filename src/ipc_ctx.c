@@ -35,11 +35,18 @@ void IpcLogEmit(const IpcContext *ctx, int32_t level, const char *format, ...)
     }
 
     /*
-     * 级别解析：先看本模块有没有单独设过，没有就用全局的。
-     * 过滤放在最前面 —— 连 va_list 都不构造，所以「关掉 DEBUG」是零成本，
-     * 而不是「格式化完再丢掉」。
+     * 级别解析：先看本模块有没有单独设过**合法**值，没有（或越界）就用
+     * 全局的。过滤放在最前面 —— 连 va_list 都不构造，所以「关掉 DEBUG」
+     * 是零成本，而不是「格式化完再丢掉」。
+     *
+     * 模块级值必须做与 IpcSetLogLevel 同样的消毒：一个越界值（例如 7）
+     * 若直接当有效级别用，`level(4=ERROR) < 7` 会连 ERROR 都吞掉 ——
+     * 「把级别调高」反而让最严重的日志消失，失效方向不安全。
+     * 越界一律视同「没填」（沿用全局），与全局侧「0 或非法 = 恢复默认」
+     * 的语义对齐。
      */
-    if (ctx != NULL && ctx->logLevel != 0) {
+    if (ctx != NULL && ctx->logLevel >= (int32_t)IPC_LOG_DEBUG &&
+        ctx->logLevel <= (int32_t)IPC_LOG_ERROR) {
         effective = ctx->logLevel;
     } else {
         effective = IpcLogGlobalLevel();
@@ -62,7 +69,11 @@ void IpcLogEmit(const IpcContext *ctx, int32_t level, const char *format, ...)
         return;
     }
     va_start(args, format);
-    IpcLogGlobalEmitVa(level, moduleId, format, args);
+    /*
+     * 走**不分发过滤**的出口：级别已经在上面按 effective 滤过了。
+     * 若改回 IpcLogGlobalEmitVa，会被全局级别再滤一次，模块级覆盖就失效了。
+     */
+    IpcLogDispatchVa(level, moduleId, format, args);
     va_end(args);
 }
 
@@ -72,14 +83,29 @@ void IpcLogEmit(const IpcContext *ctx, int32_t level, const char *format, ...)
 
 int32_t IpcCheckAlive(const IpcContext *ctx)
 {
-    if (ctx == NULL || ctx->fd < 0) {
-        return IPC_ERR_STATE;
+    /*
+     * 判定的先后顺序是有语义的，别随手调换：
+     * 1) 空指针是**参数**错误，与生命周期无关 → INVAL；
+     *    早先把它和「没有合法端点」合并成 STATE，于是 IpcPost(NULL, ...) 报
+     *    STATE，调用方无法区分「我传错了」和「对象已失效」。
+     * 2) 停止态**先于** fd 检查：IpcUnregister 之后 fd 已置 -1，但对象仍然
+     *    存在且已明确停止，报 STOPPED 才有意义（测试期望的正是这个）；
+     *    若先看 fd，注销后的每次收发都会退化成 STATE，把「已停止」这个
+     *    可恢复判断信息丢掉。
+     * 3) 端点不可恢复故障 → IO；此时 fd 通常仍然有效。
+     * 4) 最后才是「没有合法端点」→ STATE（生命周期阶段用错，例如没注册）。
+     */
+    if (ctx == NULL) {
+        return IPC_ERR_INVAL;
+    }
+    if (atomic_load_explicit(&ctx->stopped, memory_order_relaxed) != 0) {
+        return IPC_ERR_STOPPED;
     }
     if (atomic_load_explicit(&ctx->fatalError, memory_order_relaxed) != 0) {
         return IPC_ERR_IO; /* 端点进了不可恢复的故障态 */
     }
-    if (atomic_load_explicit(&ctx->stopped, memory_order_relaxed) != 0) {
-        return IPC_ERR_STOPPED;
+    if (ctx->fd < 0) {
+        return IPC_ERR_STATE;
     }
     return IPC_OK;
 }

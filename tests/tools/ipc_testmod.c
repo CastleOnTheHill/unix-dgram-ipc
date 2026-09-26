@@ -510,6 +510,7 @@ static void Usage(void)
                   "  --max-payload <n>   0 表示用库的缺省值\n"
                   "  --pending <n>       0 表示用库的缺省值\n"
                   "  --journal <path>    追加写 journal\n"
+                  "  --group <name>      端点属组；给了就变 0660（供跨 uid 用例用）\n"
                   "  --script <path>     脚本文件；不给则读 stdin\n"
                   "  --serve-ms <n>      脚本之后继续服务 N 毫秒\n");
 }
@@ -521,6 +522,7 @@ int main(int argc, char **argv)
     const char *ns     = "testns";
     const char *script = NULL;
     const char *journalPath = NULL;
+    const char *group      = NULL;
     uint32_t    maxPayload = 0;
     int32_t     pending    = 0;
     int32_t     serveMs    = 200;
@@ -552,6 +554,8 @@ int main(int argc, char **argv)
             pending = (int32_t)strtol(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--journal") == 0 && i + 1 < argc) {
             journalPath = argv[++i];
+        } else if (strcmp(argv[i], "--group") == 0 && i + 1 < argc) {
+            group = argv[++i];
         } else if (strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
             script = argv[++i];
         } else if (strcmp(argv[i], "--serve-ms") == 0 && i + 1 < argc) {
@@ -606,6 +610,15 @@ int main(int argc, char **argv)
     options.moduleId     = module;
     options.ns           = ns;
     options.confPath     = conf;
+    /*
+     * 属组。不给就是 NULL = 不指定属组，库会把端点设成 0600（只属主可写）。
+     *
+     * 之所以要暴露这个选项：跨 uid 用例（t07）必须靠**属组**让两个 uid
+     * 互相写得进对方的端点。用「把目录放开到 0777」是没用的 —— 端点文件
+     * 的模式由库自己设，与目录模式无关；实测踩过：目录 0777 下 nobody 向
+     * root 的端点发送仍然是 EACCES(perm)。
+     */
+    options.groupName    = group;
     options.maxPayload   = maxPayload;
     options.maxPending   = pending;
     options.dispatch     = IpcRefHostDispatch;

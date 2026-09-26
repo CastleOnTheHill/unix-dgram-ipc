@@ -54,6 +54,19 @@ void IpcLogGlobalEmit(int32_t level, const char *moduleId, const char *format, .
 void IpcLogGlobalEmitVa(int32_t level, const char *moduleId, const char *format,
                         va_list args) IPC_PRINTF_LIKE(3, 0);
 
+/*
+ * 只选出口、**不做级别过滤**的一条路径。调用方必须已经按「有效级别」滤过。
+ *
+ * 为什么需要它（不是冗余）：过滤用的有效级别随调用方而变 —— IpcLogEmit 用
+ * ctx->logLevel，而 IpcLogGlobalEmitVa 用全局级别。带上下文的调用如果已经按
+ * 模块级滤完再走全局那条，就会被**全局**级别二次过滤：模块把级别开到 DEBUG、
+ * 全局压到 ERROR 时，本模块的 DEBUG 永远出不来，模块级覆盖形同虚设。
+ *
+ * 判据很简单：**已经滤过 → 用这个；还没滤过 → 用 IpcLogGlobalEmitVa。**
+ */
+void IpcLogDispatchVa(int32_t level, const char *moduleId, const char *format,
+                      va_list args) IPC_PRINTF_LIKE(3, 0);
+
 /* 取出当前生效的全局级别（把「未设置」解析成默认值之后的结果）。 */
 int32_t IpcLogGlobalLevel(void);
 

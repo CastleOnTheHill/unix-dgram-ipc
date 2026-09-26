@@ -125,13 +125,20 @@ static void DrainWakePipe(IpcRefHost *host)
 
 static void WakeSelectThread(IpcRefHost *host)
 {
-    char byte = 'w';
+    char    byte = 'w';
+    ssize_t n;
 
     if (!host->wakeCreated) {
         return;
     }
-    /* 管道是 O_NONBLOCK：满了说明已经有人写过，本来就会醒，忽略 EAGAIN。 */
-    (void)write(host->wakeFd[1], &byte, 1);
+    /*
+     * 管道是 O_NONBLOCK：满了说明已经有人写过，本来就会醒，EAGAIN 属正常路径。
+     * 但**不能**用 (void) 把返回值丢掉 —— glibc 给 write 标了 warn_unused_result，
+     * 而 (void) 转换压不住它，在 -Werror 下会直接编译失败（集成测试因此整个
+     * 没编译过）。把结果接到局部变量里才算消费掉。
+     */
+    n = write(host->wakeFd[1], &byte, 1);
+    (void)n;
 }
 
 /* 在持锁状态下找 handler。找不到返回 NULL。 */
@@ -489,6 +496,18 @@ static void *WorkerMain(void *arg)
          */
         job = host->jobs[host->jobHead];
         host->jobs[host->jobHead].payload = NULL;
+        /*
+         * 结构体拷贝只复制指针的**值**：ns / src / dst 仍然指着队列槽里
+         * 的数组，而槽马上回到环里，会被下一次 FillJob 先 memset 再写上
+         * 新名字。不重指的话，本回调读 message->src 拿到的就是**别人的
+         * 身份** —— 一次静默的串包，外加跨线程数据竞争（UB）。
+         * data 不用重指：它指向 malloc 出来的载荷缓冲，所有权已经随这次
+         * 拷贝转移到 worker（槽里的指针刚被置 NULL，worker 负责释放）。
+         * reply 是按值携带的，结构体拷贝自然带上。
+         */
+        job.message.ns  = job.ns;
+        job.message.src = job.src;
+        job.message.dst = job.dst;
         host->jobHead = (host->jobHead + 1) % host->jobCap;
         host->jobCount--;
 
@@ -631,7 +650,41 @@ int32_t IpcRefHostRun(IpcRefHost *host)
     host->running = 1;
     (void)pthread_mutex_unlock(&host->lock);
 
-    atomic_store_explicit(&host->stopRequested, 0, memory_order_relaxed);
+    /*
+     * 这里**故意不**清 stopRequested。原来写的是无条件
+     *     atomic_store(&host->stopRequested, 0);
+     * 那是个能把进程永久挂死的 bug，机制如下。
+     *
+     * 调用方（宿主）通常这样用：主线程启动宿主线程跑 Run()，自己干活，
+     * 收尾时 Stop() + pthread_join(宿主线程)。于是存在一个窗口：
+     * **Stop() 已经执行完，而宿主线程还没被调度、还没进到 Run() 里**。
+     * 此时 Stop 已经把 stopRequested 置成 1 并往自管道写了唤醒字节；
+     * Run 一进来就把它清成 0 —— 停止请求被整个吃掉。后果是：
+     *   - select 线程的退出条件（`while (!stopRequested)`）永远不成立，
+     *     它就按 200ms 超时一直空转下去；
+     *   - Run() 卡在 pthread_join(select) 上不返回；
+     *   - 调用方卡在 pthread_join(宿主线程) 上不返回；
+     *   - 进程再也退不出去。
+     *
+     * 用 gdb 抓到的现场（三者同时成立，正是上面这条链）：
+     *   SelectMain      @ refhost.c 的 select() 里，反复超时
+     *   IpcRefHostRun   @ pthread_join(selectThread)
+     *   主线程          @ pthread_join(hostThread)
+     *
+     * 这个窗口不是理论上的：只要脚本/主循环短到「跑完并 Stop 的速度快过
+     * 新线程被调度」，它就必然发生。实测把进程钉在单核（taskset -c 0）后
+     * 40/40 稳定复现；集成测试里表现为**偶发**的「发送方进程 4s 内没结束」，
+     * 而且只在脚本里没有 sleep 的进程上出现。
+     *
+     * 契约上也站不住：refhost.h 写明 Stop「任意线程可调，幂等」，Run
+     * 「阻塞直到 IpcRefHostStop() 被调用」。一个先于 Run 到达的 Stop 必须
+     * 被认账 —— Run 应当立刻收摊返回。
+     *
+     * 不清它有没有副作用？没有。下面照常起 worker 与 select 线程，而它们
+     * 一进循环就看到 stopRequested 已经是 1，立刻各自收摊返回，Run 随即
+     * 返回。用 IPC 发出去的报文不受影响（发送发生在调用方自己的线程上）。
+     * 重复 Run 本来就不支持（见 refhost.h：Run 一次，之后 Destroy）。
+     */
     host->runResult = IPC_OK;
 
     for (i = 0; i < host->options.workers; i++) {

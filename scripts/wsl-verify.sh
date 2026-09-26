@@ -53,6 +53,13 @@ if [ ${#WANT[@]} -eq 0 ]; then
     WANT=(preflight lib separation coverage-selftest unit integration coverage asan)
 fi
 
+# 每步的外层时限。用例看门狗只管「用例内部挂起」；这里管的是「还没进到用例
+# 就挂住」（构造函数、套件驱动、多进程同步）。超时按失败记，而不是让整条
+# 流水线一直挂着 —— 实测踩过：单元测试卡死 12 分钟，日志停在某一行不动，
+# 看起来像「还在跑」，只能靠人发现。
+UNIT_TIMEOUT="${UNIT_TIMEOUT:-900}"
+INTEG_TIMEOUT="${INTEG_TIMEOUT:-1800}"
+
 want() {
     _w="$1"; shift
     for _x in "${WANT[@]}"; do
@@ -184,13 +191,23 @@ if want separation; then
 fi
 
 # ---- 3) 检查器自检 --------------------------------------------------
+#
+# 两条自检绑在同一个开关（coverage-selftest）下：本仓库的纪律是「任何
+# 『检查通过』的结论，都必须先有一个反例证明这个检查能报错」。覆盖率门槛
+# 和用例看门狗都属此类 —— 一个卡死的用例必须能被判成失败，而不是把套件
+# 拖成「还在跑」。
 
 if want coverage-selftest; then
-    Section "步骤 3：覆盖率门槛自检（证明它真的会判不达标）"
+    Section "步骤 3：自检（证明这些检查真的会报脏）"
     if Step "make coverage-selftest" make coverage-selftest; then
         Record coverage-selftest PASS "4 个对照里 1 个达标、3 个被拒"
     else
         Record coverage-selftest FAIL "门槛逻辑坏了"
+    fi
+    if Step "make unit-selftest" make unit-selftest; then
+        Record unit-selftest PASS "挂起被判为失败（退出码 1）"
+    else
+        Record unit-selftest FAIL "看门狗没能把挂起判成失败"
     fi
 fi
 
@@ -198,7 +215,7 @@ fi
 
 if want unit; then
     Section "步骤 4：白盒单元测试"
-    if Step "make unit" make unit > /tmp/step_unit.log 2>&1; then
+    if Step "make unit" timeout "$UNIT_TIMEOUT" make unit > /tmp/step_unit.log 2>&1; then
         tail -25 /tmp/step_unit.log
         # 关键：把被测程序**自己的**汇总行打出来，证明它真的跑到了用例，
         # 而不是提前 usage 退出。这一段是给「验证步骤必须能证明真的跑到
@@ -230,7 +247,8 @@ if want integration; then
         echo "   注意：当前不是 root，跨 uid 的用例会报 BLOCKED，"
         echo "         整条套件因此以退出码 2 结束（这是设计，不是失败）。"
     fi
-    if Step "make integration" make integration > /tmp/step_integ.log 2>&1; then
+    if Step "make integration" timeout "$INTEG_TIMEOUT" make integration \
+            > /tmp/step_integ.log 2>&1; then
         tail -20 /tmp/step_integ.log
         Record integration PASS "$(grep -E '^== ' /tmp/step_integ.log | tail -1)"
     else

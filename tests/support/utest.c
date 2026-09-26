@@ -10,9 +10,12 @@
  */
 #include "utest.h"
 
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "ipc/ipc.h" /* 只为 IpcResultToString，打印返回码时用 */
 
@@ -24,6 +27,44 @@ static int32_t   g_caseCount;
 static int32_t   g_currentFailed;
 static const char *g_currentName  = "(none)";
 static const char *g_currentSuite = "(none)";
+
+/* ------------------------------------------------------------------ */
+/* 用例看门狗：让「挂起」变成「失败」                                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 一个卡住的用例（实测：在库的 condvar 上无限等）会让整个套件看起来
+ * 「还在跑」。这比失败更糟：失败有名字、有行号、有非零退出码；挂起什么都
+ * 没有 —— 本地表现是「跑了十几分钟没动静」，CI 上就是一直挂着，只能靠人
+ * 发现。所以运行器必须给每个用例加时限。
+ *
+ * 超时之后**不能**从信号处理函数里返回、也不能 longjmp 出去：现场停在库
+ * 内部的 pthread_mutex/pthread_cond 中间态，跳出来会把锁留在锁定状态，
+ * 后面每个用例都会以「莫名其妙失败」的形式连坐，比原问题更难查。所以把
+ * 卡住的用例名报出来，然后 _exit(1)（失败，而不是「没跑成」的 2）。
+ *
+ * 时限用环境变量 IPC_UTEST_TIMEOUT 覆盖（秒，0 = 关闭看门狗）。
+ */
+static int         g_watchdogSec = 30;
+static int         g_hangControl = 0;
+static const char *g_wdSuite     = "(none)";
+static const char *g_wdName      = "(none)";
+
+static void UtestWatchdogAlarm(int sig)
+{
+    static const char head[] = "\n!! 用例挂起（超过看门狗时限）：";
+    static const char dot[]  = ".";
+    static const char tail[] = "\n   判为**失败**（退出码 1）：挂起既不是「通过」，也不是\n"
+                               "   「还在跑」。剩余用例未运行 —— 先查这个用例，别只看总数。\n";
+    (void)sig;
+    /* 信号处理函数里只用 async-signal-safe 的 write()。 */
+    (void)!write(STDERR_FILENO, head, sizeof(head) - 1);
+    (void)!write(STDERR_FILENO, g_wdSuite, strlen(g_wdSuite));
+    (void)!write(STDERR_FILENO, dot, sizeof(dot) - 1);
+    (void)!write(STDERR_FILENO, g_wdName, strlen(g_wdName));
+    (void)!write(STDERR_FILENO, tail, sizeof(tail) - 1);
+    _exit(1);
+}
 
 int32_t UtestRegister(const char *suite, const char *name, UtestFunc func)
 {
@@ -78,10 +119,34 @@ void UtestFail(const char *file, int line, const char *expr, const char *fmt, ..
 
 int32_t UtestRunAll(const char *filter)
 {
-    int32_t index;
-    int32_t ran     = 0;
-    int32_t failed  = 0;
-    int32_t skipped = 0;
+    int32_t     index;
+    int32_t     ran     = 0;
+    int32_t     failed  = 0;
+    int32_t     skipped = 0;
+    const char *env;
+    long        seconds;
+
+    /* 看门狗时限：默认 30 秒/用例，可用 IPC_UTEST_TIMEOUT 覆盖。 */
+    env = getenv("IPC_UTEST_TIMEOUT");
+    if (env != NULL && env[0] != '\0') {
+        seconds = strtol(env, NULL, 10);
+        if (seconds < 0) {
+            seconds = 0;
+        }
+        if (seconds > 3600) {
+            seconds = 3600;
+        }
+        g_watchdogSec = (int)seconds;
+    }
+    g_hangControl = (getenv("IPC_UTEST_HANG_CONTROL") != NULL);
+    if (g_watchdogSec > 0) {
+        (void)signal(SIGALRM, UtestWatchdogAlarm);
+        printf("   用例看门狗: 每个用例 %d 秒（IPC_UTEST_TIMEOUT 可改，0=关闭）\n",
+               g_watchdogSec);
+    } else {
+        printf("   用例看门狗: **已关闭**（IPC_UTEST_TIMEOUT=0）——"
+               " 挂起的用例不会被发现\n");
+    }
 
     if (g_caseCount == 0) {
         /*
@@ -92,6 +157,25 @@ int32_t UtestRunAll(const char *filter)
         fprintf(stderr, "!! utest: 一个用例都没有登记到。constructor 没生效或\n"
                         "   测试文件没被编进来 —— 不能当成通过。\n");
         return -1;
+    }
+
+    if (g_hangControl) {
+        /*
+         * 看门狗的自检入口：故意挂住不返回，它**必须**被看门狗判为失败。
+         * 没有这条，看门狗自己失灵时和「全部通过」一样安静 —— 本仓库对
+         * 每个检查器的要求都是「先证明它能报脏」。
+         * 由 make unit-selftest 驱动。
+         */
+        g_wdSuite = "control";
+        g_wdName  = "deliberate_hang";
+        printf("  [控制] control.deliberate_hang ... ");
+        (void)fflush(stdout);
+        if (g_watchdogSec > 0) {
+            (void)alarm((unsigned)g_watchdogSec);
+        }
+        for (;;) {
+            (void)pause(); /* 等看门狗的信号；正常情况下永远等不到别的 */
+        }
     }
 
     for (index = 0; index < g_caseCount; index++) {
@@ -105,10 +189,18 @@ int32_t UtestRunAll(const char *filter)
         g_currentFailed = 0;
         g_currentName   = testCase->name;
         g_currentSuite  = testCase->suite;
+        g_wdSuite       = testCase->suite;
+        g_wdName        = testCase->name;
         printf("  [%02d/%02d] %s.%s ... ", index + 1, g_caseCount, testCase->suite,
                testCase->name);
         (void)fflush(stdout);
+        if (g_watchdogSec > 0) {
+            (void)alarm((unsigned)g_watchdogSec);
+        }
         testCase->func();
+        if (g_watchdogSec > 0) {
+            (void)alarm(0);
+        }
         testCase->ran    = 1;
         testCase->failed = g_currentFailed;
         if (g_currentFailed == 0) {

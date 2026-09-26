@@ -210,12 +210,19 @@ void IpcLogEmit(const IpcContext *ctx, int32_t level, const char *format, ...)
 /* ------------------------------------------------------------------ */
 
 /*
- * 线程局部标记：非 NULL 表示「本线程正在 execute 宿主的 dispatch 调用」。
+ * 线程局部标记：非 NULL 表示「本线程正在 execute 宿主的 dispatch 调用」
+ * （值是那个正在被分发的上下文）。
  *
- * 它精确地识别出「dispatch 是内联执行回调」这种宿主写法：那时回调就在
- * dispatch 的调用栈里跑，标记是命中的。而「dispatch 只是把报文投进线程池」
- * 的宿主，在回调真正执行时 dispatch 早就返回了，标记早已清掉 —— 于是
- * IpcSend 正常工作，这正是老系统的形态。
+ * IpcSend 用它做死锁检测，判定是 **!= NULL**，刻意不做同上下文限定：
+ *   - 命中的是「dispatch 内联执行回调」这种宿主写法：那时回调就在
+ *     dispatch 的调用栈里跑，标记是命中的；
+ *   - 老系统的形态是**一条** select 线程服务所有上下文 —— 在 ctx A 的
+ *     内联回调里对 ctx B 做 IpcSend，回复要靠同一条（正卡在回调里的）
+ *     线程读回，照样死锁。所以只要本线程正在**任意** dispatch 里就拒绝。
+ *     早期版本判 `== ctx`，恰好放过这种跨上下文的死锁；
+ *   - 「dispatch 只是把报文投进线程池」的宿主不受影响：回调真正执行时
+ *     dispatch 早已返回，本线程（worker）的标记是 NULL，IpcSend 正常
+ *     工作 —— 这正是老系统的形态。
  *
  * 用一个精心放置的标记来区分两种线程模型，比加一个「宿主模式」配置项要好：
  * 配置项写错了不会报错，只会静默死锁。
@@ -228,7 +235,14 @@ extern __thread IpcContext *IpcTlsDispatchContext;
 
 /* ipc_ctx.c */
 
-/* 上下文是否还能收发：未停止、未拆除、端点未进入故障态。 */
+/*
+ * 上下文是否还能收发。返回值有明确分工，调用方据此区分「谁错了」：
+ *   ctx == NULL          → IPC_ERR_INVAL（参数错，与生命周期无关）
+ *   已 RequestStop/注销   → IPC_ERR_STOPPED（停止态优先于 fd 状态）
+ *   端点不可恢复故障     → IPC_ERR_IO
+ *   没有合法端点（fd<0） → IPC_ERR_STATE（生命周期阶段用错）
+ *   IPC_OK               → 可以收发
+ */
 int32_t IpcCheckAlive(const IpcContext *ctx);
 
 /*

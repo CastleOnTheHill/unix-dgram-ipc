@@ -50,6 +50,12 @@ PID_A="$LAST_PID"
 
 JWait "$JournalA" '^DONE ' 5000 || TFail "alpha 没能在 5s 内结束"
 
+# beta 的脚本是「服务 2s 再停」，它自己的 STATS 要等那一觉睡完才出来。
+# 不先等它，下面针对 JournalB 的两条 JStatIs 会读到**空**，报成
+# 「期望 1，实际 <空>」—— 看起来像计数错，其实只是还没打印。t06 里有这
+# 一步，t02 漏了；是同一种同步缺失，不是两个不同的 bug。
+JWait "$JournalB" '^STATS ' 4000 || TFail "beta 没有打出 STATS"
+
 # ---- 断言：发出去的是 REQ，回来的是那一条的回复 ----
 TCheck "alpha 的同步发送成功" grep -qE '^SEND beta ok$' "$JournalA"
 # "echo:" 5 字节 + "ping123" 7 字节 = 12

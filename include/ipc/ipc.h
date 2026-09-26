@@ -209,7 +209,7 @@ typedef enum {
     IPC_ERR_PROTO           = -10,   /* 报文格式非法：magic/版本/长度/类型校验失败 */
     IPC_ERR_TIMEOUT         = -11,   /* 等待回复超时，仅 IpcSendTimeout 会返回 */
     IPC_ERR_STOPPED         = -12,   /* 上下文已停止（IpcRequestStop 之后） */
-    IPC_ERR_DEADLOCK        = -13,   /* 在 dispatch 内联线程里调 IpcSend，会死锁，提前拒绝 */
+    IPC_ERR_DEADLOCK        = -13,   /* 在（任意上下文的）dispatch 内联线程里调 IpcSend，会死锁，提前拒绝 */
     IPC_ERR_MSGSIZE         = -14,   /* 载荷超过 maxPayload，**发送动作之前**即拒绝 */
     IPC_ERR_CONFIG          = -15,   /* 配置解析失败：条目重复、路径重复、身份歧义 */
     IPC_ERR_TOOMANY         = -16,   /* 并发同步请求槽位用尽（maxPending） */
@@ -377,7 +377,10 @@ typedef struct {
  *
  * 允许在这个函数里调用：IpcReply（仅 REQ）、IpcPost、IpcBroadcast、IpcSend。
  *   —— 其中 IpcSend 只有在线程池里执行时才安全；若宿主把 dispatch 写成
- *      「在本线程内联调回调」，则 IpcSend 会返回 IPC_ERR_DEADLOCK 而不是死锁。
+ *      「在本线程内联调回调」，则 IpcSend 会返回 IPC_ERR_DEADLOCK 而不是
+ *      死锁 —— **无论 IpcSend 操作的是哪个上下文**：老系统是一条 select
+ *      线程服务所有上下文，对另一个上下文的同步发送同样要靠这条正卡在
+ *      回调里的线程读回回复，属于同一种死锁。
  */
 typedef int32_t (*IpcDispatchFunc)(IpcContext *ctx, const IpcMessage *message,
                                    void *hostUser);
@@ -594,6 +597,8 @@ typedef struct {
     /*
      * 本模块的最低日志级别。**0 表示沿用 IpcSetLogLevel() 设的全局级别**，
      * 不是 IPC_LOG_DEBUG —— 全零初始化必须等于「全取默认值」。
+     * 超出 DEBUG..ERROR 范围的非法值同样视同 0（沿用全局），不报错 ——
+     * 与 IpcSetLogLevel 对非法值的处理保持一致。
      * 之所以允许逐模块单独调：现场排障往往只需要把某一个模块调到 DEBUG，
      * 把整套都打开会把真实系统的日志冲掉。
      */
@@ -671,17 +676,21 @@ int32_t IpcGetSelectFd(const IpcContext *ctx);
  * 在哪里调用：宿主那个独立 select 线程，在 IpcGetSelectFd() 返回的 fd
  * 可读时调用。**必须在 select 线程上调用**，不要在业务线程上随便调。
  *
- * maxCount：本次最多处理多少条。<=0 表示不限（一路读到 EAGAIN）。
- *   担心在 select 线程上滞留过久时，可以给一个上限（例如 64）。
+ * maxCount：本次最多**读取**多少条 —— 被校验丢弃的报文同样计入。这是
+ *   刻意的：上限的职责是约束 select 线程在本函数里的滞留时间，而垃圾
+ *   报文（畸形头 / 凭据不符 / 越界截断）消耗的时间和合法报文一样多；
+ *   若只数交付，一段全垃圾的洪泛就能让上限永不命中。<=0 表示不限
+ *   （一路读到 EAGAIN）。
  *
  * 返回值：
- *     >=0 —— 本次成功交给宿主的报文条数；
+ *     >=0 —— 本次成功交给宿主的报文条数（可以小于 maxCount，甚至为 0）；
  *     <0  —— 错误码。IPC_ERR_STOPPED 表示已请求停止，宿主应当收摊；
  *            其它负值表示端点出了故障（例如 fd 被外部关掉）。
  *
- * 剩余报文：若返回值 == maxCount 且 maxCount > 0，说明可能还有剩余。
- * 对 level-triggered 的 select/poll 不用管，下一次 select 会立刻返回；
- * 只有在边沿触发（EPOLLET）的宿主上才需要再调一次。
+ * 剩余报文：maxCount > 0 且本次因上限提前返回时，可能还有剩余。对
+ * level-triggered 的 select/poll 不用管，下一次 select 会立刻返回；
+ * 边沿触发（EPOLLET）的宿主**不要传正数上限** —— 截断读取会让剩余报文
+ * 等不到下一次通知；传 0 一路读净即可。
  *
  * 本函数**不阻塞**：读不到就返回 0，不会等在那里。
  */
@@ -738,7 +747,8 @@ int32_t IpcPost(IpcContext *ctx, const char *dstModuleId, uint32_t event,
  *      这样对端重启后残留的陈旧回复、以及别的模块冒充的回复都会被拒绝
  *      （计入 replyUnmatched）。请求方自己重启也一样安全。
  *   3. 等待期间上下文被 IpcRequestStop() → 返回 IPC_ERR_STOPPED。
- *   4. 在 dispatch 内联线程上调用 → 返回 IPC_ERR_DEADLOCK，绝不静默死锁。
+ *   4. 在 dispatch 内联线程上调用（**无论目标是哪个上下文**）→ 返回
+ *      IPC_ERR_DEADLOCK，绝不静默死锁；
  *   5. 等待表满（maxPending）→ IPC_ERR_TOOMANY，且**不发送**。
  *
  * 谁负责把回复读回来：宿主的 select 线程。也就是说，调用本函数的业务线程

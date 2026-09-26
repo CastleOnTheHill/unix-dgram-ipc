@@ -62,7 +62,7 @@ TOOLS_BIN   := $(patsubst tests/tools/%.c,$(BUILD)/bin/%,$(TOOLS_SRC))
 SUPPORT_OBJ := $(patsubst tests/support/%.c,$(BUILD)/obj/support/%.o,$(SUPPORT_SRC))
 UNIT_OBJ    := $(patsubst tests/unit/%.c,$(BUILD)/obj/unit/%.o,$(UNIT_SRC))
 
-.PHONY: all lib test unit integration tools bench coverage cov-threshold \
+.PHONY: all lib test unit unit-selftest integration tools bench coverage cov-threshold \
         coverage-selftest check-separation dev-check clean clean-all help
 
 all: lib
@@ -179,6 +179,29 @@ unit: $(UNIT_BIN)
 	@echo "== 白盒单元测试"
 	@$(UNIT_BIN)
 
+# 看门狗自检：故意挂起一个用例，运行器**必须**把它判为「失败」。
+# 没有这条，看门狗自己失灵时和「全部通过」一样安静。
+# 外层套 timeout 是防"看门狗自检本身把 CI 挂住"—— 那正是它要治的病。
+# 判据三条：报出「用例挂起」、退出码是 1（失败，不是「没跑成」的 2）、
+# 且不是被外层 timeout 杀的（124 = 看门狗没生效）。
+unit-selftest: $(UNIT_BIN)
+	@echo "== 单元测试看门狗自检（故意挂起，必须被判为失败）"
+	@out=$$(IPC_UTEST_HANG_CONTROL=1 IPC_UTEST_TIMEOUT=2 timeout 60 $(UNIT_BIN) 2>&1); \
+	rc=$$?; \
+	if ! printf '%s\n' "$$out" | grep -q '用例挂起'; then \
+		echo "!! 看门狗自检失败：没有报出「用例挂起」（退出码 $$rc）"; \
+		printf '%s\n' "$$out"; exit 1; \
+	fi; \
+	if [ $$rc -eq 124 ]; then \
+		echo "!! 看门狗自检失败：进程是被外层 timeout 杀的，看门狗没生效"; \
+		exit 1; \
+	fi; \
+	if [ $$rc -ne 1 ]; then \
+		echo "!! 看门狗自检失败：挂起应判为失败（退出码 1），实际 $$rc"; \
+		exit 1; \
+	fi; \
+	echo "   通过：挂起被判为失败（退出码 1），而不是无声地一直跑"
+
 # 集成测试用的独立进程：参考宿主 + 库 + 各自的 main()。
 $(BUILD)/bin/%: tests/tools/%.c $(SUPPORT_OBJ) $(LIB)
 	@mkdir -p $(dir $@)
@@ -192,7 +215,11 @@ tools: $(TOOLS_BIN)
 
 integration: $(LIB) tools
 	@echo "== 黑盒集成测试（多进程，需要能建 AF_UNIX socket）"
-	@IPC_TEST_BIN=$(BUILD)/bin IPC_TEST_BUILD=$(BUILD) \
+	@# IPC_TEST_BIN 必须给**绝对路径**：测试骨架会先 cd 到实验目录再 exec
+	@# 被测程序，相对路径在 cd 之后就失效了 —— 现象是每个用例的 journal 全空、
+	@# 看起来像「模块起不来」，其实只是找不到文件。common.sh 自己也会兜一道，
+	@# 但这里给对的才是正解。
+	@IPC_TEST_BIN=$(abspath $(BUILD)/bin) IPC_TEST_BUILD=$(abspath $(BUILD)) \
 		bash tests/integration/run_all.sh
 
 test: unit integration

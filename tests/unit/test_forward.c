@@ -154,6 +154,7 @@ typedef struct {
     /* 想在 dispatch 里调一次 IpcSend（用来验证死锁检测） */
     int32_t    trySend;
     IpcContext *sendCtx;
+    const char *sendDst; /* NULL = "alpha"；跨上下文用例选不在配置表里的名字 */
     int32_t    sendRc;
 
     /* 想在 dispatch 里调一次 IpcPost */
@@ -184,8 +185,13 @@ static int32_t SinkDispatch(IpcContext *ctx, const IpcMessage *message, void *us
     }
 
     if (sink->trySend != 0 && sink->sendCtx != NULL) {
-        /* 本线程此刻正在跑 dispatch，所以这条必须被死锁检测拦下。 */
-        sink->sendRc = IpcSend(sink->sendCtx, "alpha", 0x99u, "x", 1, NULL, 0, NULL);
+        /* 本线程此刻正在跑 dispatch，所以这条必须被死锁检测拦下
+         * （无论 sendCtx 是不是正在分发的那个上下文）。目标默认 alpha；
+         * 跨上下文用例会把 sendDst 换成配置表里不存在的名字 —— 这样若
+         * 检测失手，结果是可断言的 NOENT，而不是真的挂进去等回复。 */
+        sink->sendRc = IpcSend(sink->sendCtx,
+                               (sink->sendDst != NULL) ? sink->sendDst : "alpha",
+                               0x99u, "x", 1, NULL, 0, NULL);
     }
     if (sink->tryPost != 0) {
         /* 反过来，IpcPost 是非阻塞的，必须在 dispatch 里也能用。 */
@@ -501,14 +507,69 @@ UTEST_CASE(forward, maxcount_caps_how_many_are_handled)
     UTEST_ASSERT_EQ(IpcPost(alpha, "beta", 3u, "c", 1), IPC_OK);
 
     /*
-     * 返回 == maxCount 是「可能还有剩余」的信号。这条正是 ipc.h 里写明的
-     * 契约，宿主的 level-triggered select 靠它决定要不要再来一轮。
+     * maxCount 约束的是**读取次数**（含被丢弃的报文）。这三条都是合法
+     * 报文，所以读 2 条 = 交付 2 条；「垃圾洪泛下上限仍然生效」由下面
+     * maxcount_bounds_reads_not_just_deliveries 那条专门钉住。
      */
     UTEST_ASSERT_EQ(IpcHandleReadable(beta, 2), 2);
     UTEST_ASSERT_EQ(sink.calls, 2);
     UTEST_ASSERT_EQ(IpcHandleReadable(beta, 2), 1); /* 只剩一条 */
     UTEST_ASSERT_EQ(sink.calls, 3);
     UTEST_ASSERT_EQ(IpcHandleReadable(beta, 2), 0);
+
+    FwdRetire(beta);
+    FwdRetire(alpha);
+    FwdTeardown(&lab);
+}
+
+UTEST_CASE(forward, maxcount_bounds_reads_not_just_deliveries)
+{
+    /*
+     * maxCount 的洪泛回归：上限必须约束**读取次数**，而不是「成功交给
+     * 宿主的条数」。对端灌 10 条全垃圾的报文（比报头还短，逐条被丢弃），
+     * maxCount=4 时一次调用只能读 4 条 —— 否则 processed 恒为 0、上限
+     * 永不命中，select 线程可以被一段垃圾流钉死在 IpcHandleReadable 里。
+     *
+     * 判据是 recvRead 的**累进**（4 → 8 → 10），不是返回值（全垃圾时
+     * 返回值恒为 0，恰好证明「交付条数」不再是上限的判据）。
+     */
+    FwdLab      lab;
+    IpcContext *alpha = NULL;
+    IpcContext *beta  = NULL;
+    IpcStatistics st;
+    uint8_t     junk[10];
+    int32_t     i;
+
+    static const char *const modules[2] = { "alpha", "beta" };
+
+    UTEST_ASSERT_EQ(FwdSetup(&lab, modules, 2), 0);
+    UTEST_ASSERT_EQ(FwdRegister(&lab, "alpha", 0, NULL, NULL, &alpha), IPC_OK);
+    UTEST_ASSERT_EQ(FwdRegister(&lab, "beta", 0, NULL, NULL, &beta), IPC_OK);
+
+    memset(junk, 0xAA, sizeof(junk));
+    for (i = 0; i < 10; i++) {
+        UTEST_ASSERT_EQ(RawSendBytes(lab.pathB, junk, sizeof(junk)), 0);
+    }
+
+    /* 三轮 maxCount=4：读取数 4 → 8 → 10，返回值全是 0（全被丢弃）。 */
+    UTEST_ASSERT_EQ(IpcHandleReadable(beta, 4), 0);
+    FwdTakeStats(beta, &st);
+    UTEST_ASSERT_EQ(st.recvRead, (uint64_t)4);
+    UTEST_ASSERT_EQ(st.recvRejected, (uint64_t)4);
+
+    UTEST_ASSERT_EQ(IpcHandleReadable(beta, 4), 0);
+    FwdTakeStats(beta, &st);
+    UTEST_ASSERT_EQ(st.recvRead, (uint64_t)8);
+
+    UTEST_ASSERT_EQ(IpcHandleReadable(beta, 4), 0);
+    FwdTakeStats(beta, &st);
+    UTEST_ASSERT_EQ(st.recvRead, (uint64_t)10);
+
+    /* 干净了：再读是 0，计数不再前进。 */
+    UTEST_ASSERT_EQ(IpcHandleReadable(beta, 4), 0);
+    FwdTakeStats(beta, &st);
+    UTEST_ASSERT_EQ(st.recvRead, (uint64_t)10);
+    UTEST_ASSERT_EQ(st.recvDelivered, (uint64_t)0);
 
     FwdRetire(beta);
     FwdRetire(alpha);
@@ -867,6 +928,52 @@ UTEST_CASE(forward, send_inside_an_inline_dispatch_is_refused_not_deadlocked)
     UTEST_ASSERT_EQ(sink.sendRc, IPC_ERR_DEADLOCK);
     FwdTakeStats(beta, &st);
     UTEST_ASSERT_EQ(st.deadlockProbes, (uint64_t)1);
+
+    FwdRetire(beta);
+    FwdRetire(alpha);
+    FwdTeardown(&lab);
+}
+
+UTEST_CASE(forward, send_on_another_context_inside_dispatch_is_also_refused)
+{
+    /*
+     * 死锁检测的跨上下文回归。老系统的形态是**一条** select 线程服务
+     * 所有上下文：在 ctx beta 的内联 dispatch 里对 ctx alpha 做同步发送，
+     * 回复同样要靠这条（此刻正卡在回调里的）线程读回来 —— 与同上下文
+     * 的情形是同一种死锁，必须同样返回 DEADLOCK。
+     *
+     * 目标刻意选配置表里不存在的模块：若检测失手（早期版本判 `== ctx`
+     * 就是这种），IpcSend 会在 peer 查表那一步返回 NOENT —— 用例以一个
+     * 干净的断言失败收场，而不是真的挂进去等回复。
+     */
+    FwdLab      lab;
+    IpcContext *alpha = NULL;
+    IpcContext *beta  = NULL;
+    Sink        sink;
+    IpcStatistics st;
+
+    static const char *const modules[2] = { "alpha", "beta" };
+
+    UTEST_ASSERT_EQ(FwdSetup(&lab, modules, 2), 0);
+    memset(&sink, 0, sizeof(sink));
+    sink.trySend = 1;
+    sink.sendDst = "nosuchmodule"; /* 不在配置表里 */
+    UTEST_ASSERT_EQ(FwdRegister(&lab, "alpha", 0, NULL, NULL, &alpha), IPC_OK);
+    UTEST_ASSERT_EQ(FwdRegister(&lab, "beta", 0, SinkDispatch, &sink, &beta),
+                    IPC_OK);
+    /* dispatch 跑在 beta 上，发送走 alpha 的上下文（注册成功后指针才有效）。 */
+    sink.sendCtx = alpha;
+
+    UTEST_ASSERT_EQ(IpcPost(alpha, "beta", 1u, "x", 1), IPC_OK);
+    /* 主线程此刻扮演 select 线程：dispatch 在它的调用栈里内联执行。 */
+    UTEST_ASSERT_EQ(IpcHandleReadable(beta, 0), 1);
+
+    UTEST_ASSERT_EQ(sink.sendRc, IPC_ERR_DEADLOCK);
+    /* 统计记在 IpcSend 的那个 ctx（alpha）上，不在被分发的 beta 上。 */
+    FwdTakeStats(alpha, &st);
+    UTEST_ASSERT_EQ(st.deadlockProbes, (uint64_t)1);
+    FwdTakeStats(beta, &st);
+    UTEST_ASSERT_EQ(st.deadlockProbes, (uint64_t)0);
 
     FwdRetire(beta);
     FwdRetire(alpha);

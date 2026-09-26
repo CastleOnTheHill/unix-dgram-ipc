@@ -32,6 +32,24 @@ IPC_LAB="${IPC_LAB:-/tmp/ipc-lab}"
 IPC_TEST_TIMEOUT_MS="${IPC_TEST_TIMEOUT_MS:-5000}"
 IPC_INTEG_VERBOSE="${IPC_INTEG_VERBOSE:-0}"
 
+# IPC_TEST_BIN 必须在加载时就解析成**绝对路径**。
+#
+# 不做这一步会踩一个很难看的坑：StartMod 是先 `cd` 到实验目录再 exec，所以
+# 相对路径在 cd 之后就失效了 —— 被测进程一个字节都写不出来，journal 全空，
+# 现象看起来像「模块起不来」，其实只是找不到文件（错误被写进了 `<journal>.out`，
+# 而断言只看 journal）。
+#
+# 实测：`make integration` 传的是 `IPC_TEST_BIN=build/bin`（相对），于是
+# 整条套件 7/7 全红、所有 journal 都是空的；而手工跑时因为 shell 里 export
+# 的是绝对路径，这个坑完全看不见。两边的约定不一致，骨架必须自己兜住。
+if [ -n "$IPC_TEST_BIN" ] && [ "${IPC_TEST_BIN#/}" = "$IPC_TEST_BIN" ]; then
+    _ipc_abs="$(cd "$IPC_TEST_BIN" 2>/dev/null && pwd)" || _ipc_abs=""
+    if [ -n "$_ipc_abs" ]; then
+        IPC_TEST_BIN="$_ipc_abs"
+    fi
+    unset _ipc_abs
+fi
+
 # ---- 记账 ----------------------------------------------------------
 #
 # 注意：每个 tNN_*.sh 都是**独立进程**（run_all.sh 用 bash 起它），所以
@@ -246,8 +264,13 @@ StopMod() {
 # ---- 实验目录 -------------------------------------------------------
 
 # 新建一个实验目录，路径写进 $LAB。用 mktemp -d 保证不会撞已有的东西。
+#
+# 父目录取 $IPC_LAB（默认 /tmp/ipc-lab），也可以在调用时显式给一个。
+# **必须真的读 IPC_LAB**：文档与流水线都承诺「换一棵 lab root 就能把
+# 不同构建树的实验目录分开」（例如 ASan 那遍用 /opt/ipc-lab-asan），而这里
+# 原来写死 `${1:-/tmp}`，于是那个变量从来没生效过 —— 文档在骗人。
 LabNew() {
-    _ln_parent="${1:-/tmp}"
+    _ln_parent="${1:-${IPC_LAB:-/tmp/ipc-lab}}"
     mkdir -p "$_ln_parent" || return 1
     LAB=$(mktemp -d "$_ln_parent/ipc-lab-XXXXXX") || return 1
     # 护栏必须先过关再往里面写东西
